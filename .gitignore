@@ -1,0 +1,21 @@
+# firmware
+firmware/build/
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+
+# app
+app/.gradle/
+app/build/
+app/*/build/
+app/local.properties
+app/.kotlin/
+app/.idea/
+app/iosApp/Pods/
+app/iosApp/build/
+*.iml
+.DS_Store
+
+# server
+server/bin/
+firmware/sdkconfig
