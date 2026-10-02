@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_hf_client_api.h"
 #include "esp_timer.h"
@@ -37,6 +38,7 @@ static const char *TAG = "PIPE";
 #define CTRL_BLAST       0x16
 #define CTRL_SPP_BATCH   0x17   /* u8 frames per SPP write (1..4) */
 #define CTRL_KEEPALIVE   0x18   /* no-op; the phone sends it to keep RFCOMM credits flowing */
+#define CTRL_LINK_ECHO   0x19   /* u8: 1 = send downlink frames straight back up (bypasses SCO; link test) */
 
 /* ring sizes: sco_in holds 100 ms, sco_out (jitter buffer) 400 ms, both at 16 kHz */
 #define SCO_IN_BYTES     (16000 * 2 / 10)
@@ -54,6 +56,9 @@ static volatile bool s_sco_up = false;
 static volatile bool s_msbc = false;
 static volatile bool s_loopback = true;   /* on by default: proves the audio path without an app */
 static volatile bool s_blast = false;
+static volatile bool s_link_echo = false;
+typedef struct { uint16_t len; uint8_t data[FRAME_HDR + 160]; } echo_item_t;
+static QueueHandle_t s_echo_q;
 static volatile bool s_ble_up = false;
 static volatile uint32_t s_sco_gen = 0;    /* bumped on every SCO (re)connect; pipe task resyncs */
 /* call state inputs, combined by derive_call_state() */
@@ -249,6 +254,15 @@ void audio_pipe_call_state(uint8_t state)
 void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
 {
     s_st.link_rx_bytes += len;
+    if (s_link_echo) {
+        /* link test: hand the frame to the pipeline task, which owns the link batch buffer */
+        echo_item_t it;
+        it.len = len > sizeof it.data ? sizeof it.data : len;
+        memcpy(it.data, f, it.len);
+        if (xQueueSend(s_echo_q, &it, 0) != pdTRUE) s_st.rx_late++;
+        s_st.rx_frames++;
+        return;
+    }
     if (len < FRAME_HDR) {
         return;
     }
@@ -303,6 +317,13 @@ void audio_pipe_control(const uint8_t *m, uint16_t len)
     case CTRL_BLAST: if (len >= 2) s_blast = m[1] != 0; break;
     case CTRL_SPP_BATCH: if (len >= 2) audio_pipe_set_spp_batch(m[1]); break;
     case CTRL_KEEPALIVE: break;
+    case CTRL_LINK_ECHO:
+        if (len >= 2) {
+            s_link_echo = m[1] != 0;
+            s_sco_gen++;   /* resync the SCO pipeline either way */
+            ESP_LOGI(TAG, "link echo %s", s_link_echo ? "on" : "off");
+        }
+        break;
     default: ESP_LOGW(TAG, "unknown control 0x%02x", m[0]);
     }
 }
@@ -376,6 +397,17 @@ static void pipe_task(void *arg)
             s_tx_seq = 0;
             batch_reset();
         }
+        if (s_link_echo) {
+            echo_item_t it;
+            if (xQueueReceive(s_echo_q, &it, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (send_audio(it.data, it.len)) s_st.tx_frames++; else s_st.tx_dropped++;
+            }
+            /* keep the SCO-in ring from overflowing while it is not consumed */
+            size_t n; void *p;
+            while ((p = xRingbufferReceiveUpTo(s_sco_in, &n, 0, SCO_IN_BYTES))) vRingbufferReturnItem(s_sco_in, p);
+            have = 0;
+            continue;
+        }
         if (s_blast) {
             /* throughput test: max-rate 244-byte frames, codec 0xFF */
             uint8_t b[244];
@@ -430,5 +462,6 @@ void audio_pipe_init(void)
     s_sco_in = xRingbufferCreate(SCO_IN_BYTES, RINGBUF_TYPE_BYTEBUF);
     s_sco_out = xRingbufferCreate(SCO_OUT_BYTES, RINGBUF_TYPE_BYTEBUF);
     s_out_lock = xSemaphoreCreateMutex();
+    s_echo_q = xQueueCreate(16, sizeof(echo_item_t));
     xTaskCreatePinnedToCore(pipe_task, "audio_pipe", 4096, NULL, 10, NULL, 1);
 }

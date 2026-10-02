@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/coredevices/callbridge/server/audio"
 )
 
 //go:embed index.html
@@ -235,9 +236,9 @@ func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 			return
 		}
 		c := &client{conn: conn, out: make(chan []byte, 256)}
-		det := &detector{rate: 16000}
+		det := &audio.Detector{Rate: 16000}
 		var dbgFrames int
-		det.debug = func(m, th float64, n, rate int) {
+		det.Debug = func(m, th float64, n, rate int) {
 			if dbgFrames++; dbgFrames%5 == 1 || m > th {
 				log.Printf("client %s: armed frame %d: level %.4f threshold %.4f (%d samples @ %d Hz)", req.RemoteAddr, dbgFrames, m, th, n, rate)
 			}
@@ -280,13 +281,13 @@ func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 				case "burst":
 					dbgFrames = 0
 					// the read loop owns the detector; expiry is checked here, not from a timer goroutine
-					det.armed = true
-					det.deadline = time.Now().Add(3 * time.Second)
+					det.Armed = true
+					det.Deadline = time.Now().Add(3 * time.Second)
 					c.burstArmedAt = m.TServer
 				case "inject":
 					// play a tone burst towards the client; it detects it at the phone
 					now := float64(time.Now().UnixMicro()) / 1000
-					for _, f := range encodeFrames(tone(det.rate), det.rate, 0xFFF0) {
+					for _, f := range audio.EncodeFrames(audio.Tone(det.Rate), det.Rate, 0xFFF0) {
 						c.send(f, false)
 					}
 					msg, _ := json.Marshal(map[string]any{"type": "injected", "t_server": now})
@@ -301,10 +302,10 @@ func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 			if typ != websocket.MessageBinary {
 				continue
 			}
-			if det.armed && time.Now().After(det.deadline) {
-				det.armed = false
+			if det.Armed && time.Now().After(det.Deadline) {
+				det.Armed = false
 			}
-			if det.feed(data) {
+			if det.Feed(data) {
 				now := float64(time.Now().UnixMicro()) / 1000
 				up := now - c.burstArmedAt
 				lastUp = &up

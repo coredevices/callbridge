@@ -60,6 +60,15 @@ class ScoTester(private val context: Context) {
                     .setBufferSizeInBytes(minRec * (if (lowLatency) 1 else 4))
                     .build()
                 if (r.state != AudioRecord.STATE_INITIALIZED) error("AudioRecord init failed")
+                // The echo test plays back exactly what it records; the platform echo canceller then treats the
+                // incoming audio as echo and removes it (uplink measured as digital silence). Turn the effects off.
+                val sid = r.audioSessionId
+                val fx = buildList {
+                    if (android.media.audiofx.AcousticEchoCanceler.isAvailable()) android.media.audiofx.AcousticEchoCanceler.create(sid)?.let { it.enabled = false; add("AEC") }
+                    if (android.media.audiofx.NoiseSuppressor.isAvailable()) android.media.audiofx.NoiseSuppressor.create(sid)?.let { it.enabled = false; add("NS") }
+                    if (android.media.audiofx.AutomaticGainControl.isAvailable()) android.media.audiofx.AutomaticGainControl.create(sid)?.let { it.enabled = false; add("AGC") }
+                }
+                println("callbridge sco: disabled effects $fx on session $sid")
                 val tb = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                     .setAudioFormat(AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())

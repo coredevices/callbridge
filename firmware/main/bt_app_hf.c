@@ -221,6 +221,9 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
                 ESP_LOGI(BT_HF_TAG, "qos t_poll=10 request: %s", esp_err_to_name(q));
             }
             if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
+                /* AT+NREC=0: ask the phone not to run its echo canceller / noise reduction on our audio */
+                esp_err_t nr = esp_hf_client_send_nrec();
+                ESP_LOGI(BT_HF_TAG, "AT+NREC=0: %s", esp_err_to_name(nr));
                 /* connected: stop page/inquiry scan so the radio serves the link only */
                 esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
             } else if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {

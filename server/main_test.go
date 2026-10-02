@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/coredevices/callbridge/server/audio"
 )
 
 func dial(t *testing.T, url, hello string) *websocket.Conn {
@@ -146,33 +147,33 @@ func TestToneDetector(t *testing.T) {
 	for i := range quiet {
 		quiet[i] = int16((i*7919)%64 - 32)
 	}
-	frames := encodeFrames(quiet, rate, 0)
-	burst := encodeFrames(append(tone(rate), make([]int16, rate*20/1000)...), rate, uint16(len(frames)))
-	d := &detector{}
+	frames := audio.EncodeFrames(quiet, rate, 0)
+	burst := audio.EncodeFrames(append(audio.Tone(rate), make([]int16, rate*20/1000)...), rate, uint16(len(frames)))
+	d := &audio.Detector{}
 	for _, f := range frames {
-		if d.feed(f) {
+		if d.Feed(f) {
 			t.Fatal("false positive on silence")
 		}
 	}
-	d.armed = true
-	if !d.feed(burst[0]) {
+	d.Armed = true
+	if !d.Feed(burst[0]) {
 		t.Fatal("burst not detected on its first frame")
 	}
-	if d.feed(burst[1]) {
+	if d.Feed(burst[1]) {
 		t.Fatal("should disarm after detection")
 	}
 	// round trip sanity of the codec itself
-	pcm, r := decodeFrame(burst[0])
+	pcm, r := audio.DecodeFrame(burst[0])
 	if r != rate || len(pcm) != rate*20/1000 {
 		t.Fatalf("decode: rate %d len %d", r, len(pcm))
 	}
 }
 
 func TestDecodeFrameRejectsBadLength(t *testing.T) {
-	if pcm, _ := decodeFrame([]byte{0, 0, codecAdpcm16, 0, 0, 0}); pcm != nil {
+	if pcm, _ := audio.DecodeFrame([]byte{0, 0, audio.CodecAdpcm16, 0, 0, 0}); pcm != nil {
 		t.Fatal("header-only frame accepted")
 	}
-	if pcm, _ := decodeFrame(append([]byte{0, 0, codecAdpcm8k, 0, 0, 0}, make([]byte, 80)...)); pcm == nil {
+	if pcm, _ := audio.DecodeFrame(append([]byte{0, 0, audio.CodecAdpcm8k, 0, 0, 0}, make([]byte, 80)...)); pcm == nil {
 		t.Fatal("valid 8 kHz frame rejected")
 	}
 }
