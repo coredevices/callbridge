@@ -94,7 +94,7 @@ class Session(private val scope: CoroutineScope) {
     @Volatile var appEcho = false
 
     /** Keepalive period towards the ESP32 over SPP; 0 disables. Applied at connect time. */
-    var keepaliveMs = 20L
+    var keepaliveMs = 0L   // costs air time; only ever helped SPP, which is no longer the default
     private var serverClient: ServerClient? = null
     private val bleJobs = mutableListOf<Job>()
     private val serverJobs = mutableListOf<Job>()
@@ -109,7 +109,7 @@ class Session(private val scope: CoroutineScope) {
     val mtu: StateFlow<Int?> = _mtu
 
     /** When false, connectBle uses the BLE GATT link even where SPP is available (for comparison tests). */
-    var preferSpp = true
+    var preferSpp = false   // BLE carries the stream fine during a call; SPP is limited to ~2 kB/s by 1-slot packets
 
     /** Connects via a BLE advertisement: SPP to the same address when the platform has it, else GATT. */
     suspend fun connectBle(adv: Advertisement) = lock.withLock {
@@ -130,6 +130,22 @@ class Session(private val scope: CoroutineScope) {
             b
         }
         attach(t, name)
+    }
+
+    /** Connects over BLE to a known address without scanning (Android: the bonded dongle). */
+    suspend fun connectBleAddress(address: String, name: String) = lock.withLock {
+        if (bleTransport != null) return@withLock
+        val p = peripheralForAddress(address) ?: run { _ble.value = BleState.Error("no direct BLE connect on this platform"); return@withLock }
+        _ble.value = BleState.Connecting(name)
+        val b = BleTransport(p)
+        try {
+            _mtu.value = b.connect()
+        } catch (e: CancellationException) {
+            runCatching { b.disconnect() }; _ble.value = BleState.Idle; throw e
+        } catch (e: Exception) {
+            runCatching { b.disconnect() }; _ble.value = BleState.Error(e.message ?: "connect failed"); return@withLock
+        }
+        attach(b, name)
     }
 
     /** Connects straight over SPP to a bonded device (no BLE scan needed); Android only. */
@@ -256,7 +272,7 @@ class Session(private val scope: CoroutineScope) {
     /** Writes a control message; false if not connected or the write failed (the link may have just dropped). */
     suspend fun sendControl(msg: ByteArray): Boolean {
         val t = bleTransport ?: return false
-        return try { t.sendControl(msg); true } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+        return try { t.sendControl(msg); true } catch (e: CancellationException) { throw e } catch (e: Exception) { println("callbridge control write failed: $e"); false }
     }
 
     /**

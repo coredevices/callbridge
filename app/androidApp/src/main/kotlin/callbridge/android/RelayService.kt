@@ -29,12 +29,14 @@ class RelayService : Service() {
     val session = Session(scope)
     val sco by lazy { ScoTester(this) }
 
-    /** SPP straight to the bonded "callbridge" if there is one, else BLE scan (then SPP/GATT). */
+    /** BLE (the default data link), or SPP straight to the bonded device when [Session.preferSpp] is set. */
     @android.annotation.SuppressLint("MissingPermission")
     suspend fun connectAny() {
+        // the dongle is bonded (HFP); connect to its address directly. A scan is only the fallback:
+        // Android silently throttles apps that start more than 5 scans in 30 s.
         val bonded = android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.firstOrNull { it.name == "callbridge" }
         if (bonded != null) {
-            session.connectSpp(bonded.address, bonded.name)
+            if (session.preferSpp) session.connectSpp(bonded.address, bonded.name) else session.connectBleAddress(bonded.address, bonded.name)
             if (session.ble.value is callbridge.BleState.Connected) return
         }
         val adv = withTimeout(10_000) { scanCallbridge().first() }
@@ -53,13 +55,15 @@ class RelayService : Service() {
             scope.launch {
                 val result = runCatching {
                     when (cmd) {
-                        "connect" -> { session.preferSpp = true; connectAny(); session.ble.value.toString() }
-                        "connectble" -> { session.preferSpp = false; val adv = withTimeout(10_000) { scanCallbridge().first() }; session.connectBle(adv); session.ble.value.toString() }
+                        "connect", "connectble" -> { session.preferSpp = false; connectAny(); session.ble.value.toString() }
+                        "connectspp" -> { session.preferSpp = true; connectAny(); session.ble.value.toString() }
                         "disconnect" -> { session.disconnectBle(); "ok" }
                         "relay" -> { session.connectServer(url, "echo", "demo", 0); session.server.value.toString() }
                         "relayroom" -> { session.connectServer(url, "room", "solo", 0); session.server.value.toString() }
                         "appecho" -> { session.appEcho = true; if (session.server.value !is callbridge.ServerState.Connected) session.connectServer(url, "room", intent.getStringExtra("room") ?: "demo", 0); "app echoes server audio back (room ${intent.getStringExtra("room") ?: "demo"})" }
                         "unappecho" -> { session.appEcho = false; "app echo off" }
+                        "itvl6", "itvl7", "itvl8", "itvl9", "itvl10", "itvl11", "itvl12", "itvl13", "itvl14" ->
+                            "ble interval ${cmd.removePrefix("itvl").toInt() * 1.25} ms: ${session.sendControl(Control.bleInterval(cmd.removePrefix("itvl").toInt()))}"
                         "linkecho" -> "dongle link echo ${session.sendControl(Control.linkEcho(true))}"
                         "unlinkecho" -> "dongle link echo off ${session.sendControl(Control.linkEcho(false))}"
                         "scoecho" -> { if (!sco.isOpen) sco.open(); scope.launch { sco.startEcho() }; "phone echoes SCO (dongle loopback should be off)" }

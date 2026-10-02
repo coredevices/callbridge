@@ -66,6 +66,25 @@ static volatile uint16_t s_mtu = 23;
 static volatile bool s_tx_subscribed = false;
 static volatile bool s_ctl_subscribed = false;
 static volatile bool s_congested = false;
+static esp_bd_addr_t s_peer;
+/* Connection interval in 1.25 ms units. Not a multiple of the eSCO period (7.5 ms with mSBC):
+ * the phone runs both links from one clock, so a multiple locks every BLE event at the same offset
+ * from the eSCO slots. If that offset collides, the link is stuck at ~10 events/s for its lifetime. */
+static volatile uint16_t s_conn_itvl = 9;   /* 11.25 ms */
+
+static void request_conn_params(void)
+{
+    esp_ble_conn_update_params_t cp = { .latency = 0, .min_int = s_conn_itvl, .max_int = s_conn_itvl, .timeout = 400 };
+    memcpy(cp.bda, s_peer, sizeof(esp_bd_addr_t));
+    esp_ble_gap_update_conn_params(&cp);
+}
+
+void ble_gatt_set_conn_interval(uint16_t units)
+{
+    if (units < 6 || units > 40) return;
+    s_conn_itvl = units;
+    if (s_conn_id != 0xffff) request_conn_params();
+}
 
 static esp_ble_adv_data_t adv_data = {
     .set_scan_rsp = false,
@@ -188,10 +207,8 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
         s_tx_subscribed = s_ctl_subscribed = false;
         s_congested = false;
         ESP_LOGI(TAG, "connected, conn_id %d", s_conn_id);
-        /* short interval for audio: 7.5-15 ms; the central may override */
-        esp_ble_conn_update_params_t cp = { .latency = 0, .min_int = 0x06, .max_int = 0x0C, .timeout = 400 };
-        memcpy(cp.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-        esp_ble_gap_update_conn_params(&cp);
+        memcpy(s_peer, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        request_conn_params();
         break;
     }
     case ESP_GATTS_DISCONNECT_EVT:
@@ -208,7 +225,14 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
     case ESP_GATTS_WRITE_EVT: {
         uint16_t h = param->write.handle;
         if (h == s_handles[IDX_RX_VAL]) {
-            audio_pipe_rx_frame(param->write.value, param->write.len);
+            /* one or more [len u8][frame] records per write (docs/protocol.md) */
+            const uint8_t *v = param->write.value;
+            uint16_t left = param->write.len;
+            while (left > 1 && v[0] + 1 <= left) {
+                audio_pipe_rx_frame(v + 1, v[0]);
+                left -= v[0] + 1;
+                v += v[0] + 1;
+            }
         } else if (h == s_handles[IDX_CTL_VAL]) {
             audio_pipe_control(param->write.value, param->write.len);
         } else if (h == s_handles[IDX_TX_CCC] && param->write.len == 2) {

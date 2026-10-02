@@ -39,6 +39,7 @@ static const char *TAG = "PIPE";
 #define CTRL_SPP_BATCH   0x17   /* u8 frames per SPP write (1..4) */
 #define CTRL_KEEPALIVE   0x18   /* no-op; the phone sends it to keep RFCOMM credits flowing */
 #define CTRL_LINK_ECHO   0x19   /* u8: 1 = send downlink frames straight back up (bypasses SCO; link test) */
+#define CTRL_BLE_ITVL    0x1A   /* u8: BLE connection interval in 1.25 ms units */
 
 /* ring sizes: sco_in holds 100 ms, sco_out (jitter buffer) 400 ms, both at 16 kHz */
 #define SCO_IN_BYTES     (16000 * 2 / 10)
@@ -88,12 +89,26 @@ static size_t s_batch_len = 0;
 static int s_batch_n = 0;
 static volatile int s_spp_batch = 3;   /* frames per SPP write; console `batch <n>` */
 
+#define BLE_PACKET_MAX 244   /* MTU 247 - 3 */
+
 static bool send_audio(const uint8_t *frame, size_t len)
 {
-    if (!s_spp_up) {
-        return ble_gatt_notify_audio(frame, len);
-    }
     int want = s_spp_batch < 1 ? 1 : s_spp_batch > SPP_BATCH_MAX ? SPP_BATCH_MAX : s_spp_batch;
+    if (!s_spp_up) {
+        /* BLE: [len u8][frame] records, as many as `batch` and the packet allow. The link is limited
+         * in packets per second (connection events shared with eSCO), not bytes. */
+        if (len > 255) return false;
+        if (s_batch_len + 1 + len > BLE_PACKET_MAX && s_batch_n > 0) {
+            ble_gatt_notify_audio(s_batch, s_batch_len);
+            s_batch_len = 0; s_batch_n = 0;
+        }
+        s_batch[s_batch_len++] = (uint8_t)len;
+        memcpy(s_batch + s_batch_len, frame, len); s_batch_len += len;
+        if (++s_batch_n < want) return true;
+        bool ok = ble_gatt_notify_audio(s_batch, s_batch_len);
+        s_batch_len = 0; s_batch_n = 0;
+        return ok;
+    }
     if (len > MAX_LINK_FRAME || s_batch_len + 3 + len > sizeof s_batch) {
         s_batch_len = 0; s_batch_n = 0;   /* cannot happen with the sizes above; never overrun */
         return false;
@@ -282,15 +297,25 @@ void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
     if (s_loopback || !s_sco_up) {
         return;   /* loopback owns the SCO out path */
     }
-    if ((codec == CODEC_ADPCM_16K) != s_msbc) {
-        s_st.rx_late++;   /* ponytail: wrong sample rate for this SCO link; resample instead of dropping if it ever matters */
-        return;
-    }
     int16_t pcm[MAX_PCM_FRAME / 2];
     if (n * 2 > sizeof pcm / sizeof pcm[0]) n = sizeof pcm / sizeof pcm[0] / 2;
     adpcm_decode(&st, f + FRAME_HDR, n, pcm);
+    size_t samples = n * 2;
+    if (codec == CODEC_ADPCM_8K && s_msbc) {
+        /* the link is 8 kHz; a wideband (mSBC) call wants 16 kHz: linear interpolation, in place from the end */
+        if (samples * 2 > sizeof pcm / sizeof pcm[0]) samples = sizeof pcm / sizeof pcm[0] / 2;
+        for (int i = (int)samples - 1; i >= 0; i--) {
+            int16_t a = pcm[i], b = i + 1 < (int)samples ? pcm[i + 1] : pcm[i];
+            pcm[2 * i] = a;
+            pcm[2 * i + 1] = (int16_t)((a + b) / 2);
+        }
+        samples *= 2;
+    } else if (codec == CODEC_ADPCM_16K && !s_msbc) {
+        s_st.rx_late++;   /* 16 kHz frames on a narrowband call: nobody sends these today */
+        return;
+    }
     out_prefill_if_empty();
-    out_write((uint8_t *)pcm, n * 4, JITTER_MAX_MS);
+    out_write((uint8_t *)pcm, samples * 2, JITTER_MAX_MS);
 }
 
 void audio_pipe_control(const uint8_t *m, uint16_t len)
@@ -317,6 +342,7 @@ void audio_pipe_control(const uint8_t *m, uint16_t len)
     case CTRL_BLAST: if (len >= 2) s_blast = m[1] != 0; break;
     case CTRL_SPP_BATCH: if (len >= 2) audio_pipe_set_spp_batch(m[1]); break;
     case CTRL_KEEPALIVE: break;
+    case CTRL_BLE_ITVL: if (len >= 2) ble_gatt_set_conn_interval(m[1]); break;
     case CTRL_LINK_ECHO:
         if (len >= 2) {
             s_link_echo = m[1] != 0;
@@ -444,11 +470,18 @@ static void pipe_task(void *arg)
         adpcm_state_t st = { .predictor = 0, .index = 0 };
         /* ponytail: encoder state resets per frame (predictor 0, index 0) so every frame is self-contained;
          * carrying state across frames would improve quality at the cost of loss tolerance. */
+        /* the link always carries 8 kHz frames (86 bytes); a wideband call is decimated by 2 */
+        int16_t *p16 = (int16_t *)pcm;
+        size_t samples = want / 2;
+        if (msbc) {
+            for (size_t i = 0; i < samples / 2; i++) p16[i] = (int16_t)((p16[2 * i] + p16[2 * i + 1]) / 2);
+            samples /= 2;
+        }
         frame[0] = s_tx_seq; frame[1] = s_tx_seq >> 8;
-        frame[2] = msbc ? CODEC_ADPCM_16K : CODEC_ADPCM_8K;
+        frame[2] = CODEC_ADPCM_8K;
         frame[3] = 0; frame[4] = 0; frame[5] = 0;
-        adpcm_encode(&st, (const int16_t *)pcm, want / 2, frame + FRAME_HDR);
-        if (send_audio(frame, FRAME_HDR + want / 4)) {
+        adpcm_encode(&st, p16, samples, frame + FRAME_HDR);
+        if (send_audio(frame, FRAME_HDR + samples / 2)) {
             s_st.tx_frames++;
         } else {
             s_st.tx_dropped++;

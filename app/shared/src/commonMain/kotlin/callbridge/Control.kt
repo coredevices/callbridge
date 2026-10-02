@@ -16,6 +16,7 @@ object Control {
     const val SPP_BATCH = 0x17
     const val KEEPALIVE = 0x18
     const val LINK_ECHO = 0x19
+    const val BLE_INTERVAL = 0x1A
 
     val callStateNames = listOf("idle", "incoming", "dialing", "active", "sco_up")
 
@@ -31,6 +32,8 @@ object Control {
     fun keepalive() = byteArrayOf(KEEPALIVE.toByte())
     /** Link test: the ESP32 sends downlink frames straight back up, bypassing SCO and the phone's audio DSP. */
     fun linkEcho(on: Boolean) = byteArrayOf(LINK_ECHO.toByte(), if (on) 1 else 0)
+    /** Ask the ESP32 to request this BLE connection interval (1.25 ms units). */
+    fun bleInterval(units: Int) = byteArrayOf(BLE_INTERVAL.toByte(), units.coerceIn(6, 40).toByte())
     fun sppBatch(n: Int) = byteArrayOf(SPP_BATCH.toByte(), n.coerceIn(1, 4).toByte())
     /** Ping carries a u32 LE token; the pong echoes it. */
     fun ping(token: Int) = byteArrayOf(PING.toByte(), token.toByte(), (token shr 8).toByte(), (token shr 16).toByte(), (token shr 24).toByte())
