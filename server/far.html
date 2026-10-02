@@ -20,6 +20,8 @@
   .label { color: var(--text-2); font-size: 13px; margin-bottom: 4px; }
   .stats { font-variant-numeric: tabular-nums; color: var(--text-2); font-size: 13px; }
   .how { color: var(--text-2); font-size: 13px; }
+  .lat { display: flex; align-items: baseline; gap: 10px; margin: 14px 0 6px; flex-wrap: wrap; }
+  #lat { font-size: 28px; font-weight: 600; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
@@ -47,8 +49,9 @@
     <div class="label" style="margin-top:12px">Receiving (phone → your speaker)</div>
     <div class="meter"><div id="m-down" style="background:var(--down)"></div></div>
     <div class="stats" id="stats" style="margin-top:10px">–</div>
-    <div class="label" style="margin-top:14px">Last 10 s: level sent (blue) and received (orange). The horizontal offset between a burst and its echo is the round trip.</div>
-    <canvas id="graph" width="1200" height="180" style="width:100%;height:180px;background:var(--surface);border-radius:6px"></canvas>
+    <div class="lat"><span id="lat">–</span><span class="label" id="lat-note">round trip: talk in short bursts ("one… two… three")</span></div>
+    <canvas id="graph" style="width:100%;height:240px;background:var(--surface);border-radius:6px;display:block"></canvas>
+    <div class="label" style="margin-top:6px">Last 10 s. Top: level sent (blue). Bottom: level received (orange), with the sent trace shifted by the measured delay (dashed). The bar under the time axis spans the latest burst and its echo.</div>
   </div>
 
   <div class="card how">
@@ -64,24 +67,109 @@
   // level history: one sample per 20 ms frame, 10 s window; written by capture (up) and receive (down)
   const HIST = 500, upHist = new Float32Array(HIST), downHist = new Float32Array(HIST);
   let histPos = 0, lastDownPeak = 0;
-  function drawGraph() {
-    const c = $('graph'), g = c.getContext('2d'), W = c.width, H = c.height;
-    g.clearRect(0, 0, W, H);
-    g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid'); g.lineWidth = 1;
-    for (let sec = 0; sec <= 10; sec++) { const x = W - sec * W / 10; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); }
-    const draw = (hist, color, mid) => {
-      g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
-      for (let i = 0; i < HIST; i++) {
-        const v = hist[(histPos + i) % HIST], x = i * W / HIST, y = mid - v * (H / 2 - 6);
-        i ? g.lineTo(x, y) : g.moveTo(x, y);
+  // Round trip from the level traces: the lag (0-3 s) where the received envelope best matches the sent
+  // one, by normalized cross-correlation over the 10 s window. Resolution 20 ms, refined by a parabola.
+  function estimateLag(a, b, maxLag) {
+    const n = a.length, mean = v => v.reduce((x, y) => x + y, 0) / n;
+    const ma = mean(a), mb = mean(b);
+    let best = -1, bestL = -1;
+    const c = new Float32Array(maxLag + 1);
+    for (let L = 0; L <= maxLag; L++) {
+      let sab = 0, saa = 0, sbb = 0;
+      for (let i = 0; i + L < n; i++) {
+        const x = a[i] - ma, y = b[i + L] - mb;
+        sab += x * y; saa += x * x; sbb += y * y;
       }
-      g.stroke();
+      c[L] = saa && sbb ? sab / Math.sqrt(saa * sbb) : 0;
+      if (c[L] > best) { best = c[L]; bestL = L; }
+    }
+    let frac = 0;
+    if (bestL > 0 && bestL < maxLag) {
+      const d = c[bestL - 1] - 2 * c[bestL] + c[bestL + 1];
+      if (d < 0) frac = 0.5 * (c[bestL - 1] - c[bestL + 1]) / d;
+    }
+    return { lag: bestL + frac, score: best };
+  }
+  const FRAME_MS = 20, MAX_LAG = 150;   // 3 s
+  let lag = null, lagAt = 0;
+  const ordered = h => { const o = new Float32Array(HIST); for (let i = 0; i < HIST; i++) o[i] = h[(histPos + i) % HIST]; return o; };
+  setInterval(() => {
+    const a = ordered(upHist), b = ordered(downHist);
+    let peak = 0; for (const v of a) peak = Math.max(peak, v);
+    const r = peak > 0.05 ? estimateLag(a, b, MAX_LAG) : null;
+    if (r && r.score > 0.4) { lag = r.lag; lagAt = performance.now(); }
+    if (lag !== null) $('lat').textContent = `${Math.round(lag * FRAME_MS)} ms`;
+    const age = (performance.now() - lagAt) / 1000;
+    $('lat-note').textContent = lag === null ? 'round trip: talk in short bursts ("one… two… three")'
+      : r && r.score > 0.4 ? `round trip, mic → back here (match ${r.score.toFixed(2)}; playback adds the jitter buffer)`
+      : `round trip, last measured ${age.toFixed(0)} s ago; talk in short bursts to update`;
+  }, 250);
+
+  function drawGraph() {
+    const c = $('graph'), dpr = window.devicePixelRatio || 1;
+    const W = c.clientWidth, H = c.clientHeight;
+    if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
+    const g = c.getContext('2d'), css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    const AX = 46, LH = (H - AX) / 2, X = i => i * W / HIST;   // two lanes above a time axis
+    const grid = css('--grid'), text = css('--text-2'), up = css('--up'), down = css('--down');
+    g.font = '11px -apple-system, "Segoe UI", Roboto, sans-serif';
+    // grid: 100 ms ticks, 1 s lines with labels
+    for (let k = 0; k <= 100; k++) {
+      const x = W - k * W / 100, major = k % 10 === 0;
+      g.strokeStyle = grid; g.globalAlpha = major ? 1 : 0.45; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(x, major ? 0 : H - AX); g.lineTo(x, major ? H - AX + 6 : H - AX + 4); g.stroke();
+      if (major) {
+        g.globalAlpha = 1; g.fillStyle = text;
+        g.textAlign = k === 0 ? 'right' : k === 100 ? 'left' : 'center';
+        g.fillText(k === 0 ? 'now' : `−${k / 10} s`, x, H - AX + 18);
+      }
+    }
+    g.globalAlpha = 1;
+    g.strokeStyle = grid; g.beginPath(); g.moveTo(0, LH); g.lineTo(W, LH); g.moveTo(0, H - AX); g.lineTo(W, H - AX); g.stroke();
+    const a = ordered(upHist), b = ordered(downHist);
+    const trace = (v, color, base, shift = 0, dash = []) => {
+      g.strokeStyle = color; g.lineWidth = 2; g.setLineDash(dash); g.beginPath();
+      let started = false;
+      for (let i = Math.max(0, shift); i < HIST; i++) {
+        const x = X(i), y = base - v[i - shift] * (LH - 10);
+        started ? g.lineTo(x, y) : (g.moveTo(x, y), started = true);
+      }
+      g.stroke(); g.setLineDash([]);
     };
-    draw(upHist, getComputedStyle(document.documentElement).getPropertyValue('--up'), H * 0.5 - 2);
-    draw(downHist, getComputedStyle(document.documentElement).getPropertyValue('--down'), H - 4);
+    trace(a, up, LH - 3);
+    if (lag !== null) { g.globalAlpha = 0.55; trace(a, up, 2 * LH - 3, Math.round(lag), [5, 4]); g.globalAlpha = 1; }
+    trace(b, down, 2 * LH - 3);
+    g.fillStyle = text; g.textAlign = 'left';
+    g.fillText('sent', 6, 13); g.fillText('received', 6, LH + 13);
+    if (lag !== null) {
+      // delay bar from the onset of the most recent strong sent burst whose echo is inside the window
+      let peak = 0; for (const v of a) peak = Math.max(peak, v);
+      let at = -1;
+      for (let i = HIST - 2 - Math.ceil(lag); i > 0; i--) {
+        if (a[i] >= 0.5 * peak && a[i - 1] < 0.5 * peak) { at = i; break; }   // onset of the burst
+      }
+      const ms = `${Math.round(lag * FRAME_MS)} ms`;
+      g.fillStyle = css('--text'); g.textAlign = 'right'; g.font = '600 15px -apple-system, "Segoe UI", Roboto, sans-serif';
+      g.fillText(`round trip ${ms}`, W - 8, LH + 18);
+      g.font = '11px -apple-system, "Segoe UI", Roboto, sans-serif';
+      if (at >= 0 && peak > 0.05) {
+        const x1 = X(at), x2 = X(at + lag), yb = H - 12;
+        g.strokeStyle = text; g.lineWidth = 1; g.setLineDash([2, 3]);
+        g.beginPath(); g.moveTo(x1, LH - 3 - a[at] * (LH - 10)); g.lineTo(x1, yb); g.moveTo(x2, 2 * LH - 3 - a[at] * (LH - 10)); g.lineTo(x2, yb); g.stroke();
+        g.setLineDash([]); g.lineWidth = 3; g.strokeStyle = css('--text');
+        g.beginPath(); g.moveTo(x1, yb); g.lineTo(x2, yb); g.moveTo(x1, yb - 5); g.lineTo(x1, yb + 5); g.moveTo(x2, yb - 5); g.lineTo(x2, yb + 5); g.stroke();
+        g.fillStyle = css('--text'); g.font = '600 12px -apple-system, "Segoe UI", Roboto, sans-serif';
+        const right = x2 + 8 + 60 < W;
+        g.textAlign = right ? 'left' : 'right';
+        g.fillText(ms, right ? x2 + 8 : x1 - 8, yb + 4);
+      }
+    }
     requestAnimationFrame(drawGraph);
   }
   requestAnimationFrame(drawGraph);
+  window.callbridgeDebug = { upHist, downHist };   // lets a test fill the traces without a mic
   const $ = id => document.getElementById(id);
   const CODEC_OPUS = 3;
   // playback queue: Float32 chunks at the AudioContext rate
