@@ -27,8 +27,11 @@ private const val MAX_PAYLOAD = 1024
 /** RFCOMM stream to the firmware's "callbridge" SPP server: [channel u8][len u16 LE][payload]. */
 class SppLink private constructor(private val socket: BluetoothSocket) : Link {
     override val kind = "spp"
+    override val framesReadCount: Long get() = framesRead
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val audio = Channel<ByteArray>(capacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    /** Frames read from the socket; compare with what the consumer got to spot consumer stalls. */
+    @Volatile var framesRead = 0L
     private val control = Channel<ByteArray>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private val writeLock = Mutex()
     private val out = socket.outputStream
@@ -46,7 +49,7 @@ class SppLink private constructor(private val socket: BluetoothSocket) : Link {
                     val payload = ByteArray(len)
                     input.readFully(payload)
                     when (ch) {
-                        CH_AUDIO -> audio.send(payload)
+                        CH_AUDIO -> { framesRead++; audio.send(payload) }
                         CH_CONTROL -> control.send(payload)
                     }
                 }

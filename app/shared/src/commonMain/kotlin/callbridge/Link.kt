@@ -5,6 +5,8 @@ import kotlinx.coroutines.flow.Flow
 /** A data link to the ESP32 carrying audio frames and control messages (docs/protocol.md). */
 interface Link {
     val kind: String
+    /** Audio frames the link has read so far (diagnostics); 0 where not tracked. */
+    val framesReadCount: Long get() = 0
     fun audioIn(): Flow<ByteArray>
     fun controlIn(): Flow<ByteArray>
     suspend fun sendAudio(frame: ByteArray)

@@ -20,6 +20,7 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
 
 
 void bt_app_hf_reconnect_bonded(void);
+void bt_app_hf_start_reconnect(void);
 /* true once the service-level connection to the phone is up */
 bool bt_app_hf_is_connected(void);
 /* true while the transport is connecting or up but SLC not yet negotiated */

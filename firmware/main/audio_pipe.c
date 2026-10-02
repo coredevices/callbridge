@@ -8,6 +8,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_hf_client_api.h"
+#include "esp_timer.h"
 
 #include "adpcm.h"
 #include "ble_gatt.h"
@@ -33,11 +34,15 @@ static const char *TAG = "PIPE";
 #define CTRL_REQ_STATS   0x14
 #define CTRL_PING        0x15
 #define CTRL_BLAST       0x16
+#define CTRL_SPP_BATCH   0x17   /* u8 frames per SPP write (1..4) */
 
 /* ring sizes: sco_in holds 100 ms, sco_out (jitter buffer) 400 ms, both at 16 kHz */
 #define SCO_IN_BYTES     (16000 * 2 / 10)
 #define SCO_OUT_BYTES    (16000 * 2 * 4 / 10)
-#define JITTER_PREFILL_MS 40
+#define JITTER_PREFILL_MS 20
+/* depth caps: anything older than this is discarded so the SCO-out ring never becomes a latency tank */
+#define LOOPBACK_MAX_MS   40
+#define JITTER_MAX_MS     100
 #define MAX_PCM_FRAME    (16000 * 2 * FRAME_MS / 1000)   /* 640 bytes */
 
 static RingbufHandle_t s_sco_in;
@@ -57,6 +62,7 @@ static volatile uint8_t s_call_state = 0;  /* advertised: 0 idle, 1 incoming, 2 
 static struct {
     uint32_t tx_frames, rx_frames, rx_lost, rx_late, sco_drops;
     uint32_t underruns, tx_dropped;
+    uint32_t sco_in_bytes, sco_out_bytes, link_rx_bytes;   /* raw byte counters for rate checks */
 } s_st;
 
 static uint16_t s_tx_seq = 0;
@@ -127,12 +133,22 @@ static void send_stats(void)
 
 /* ---- jitter buffer / SCO out ---- */
 
-static void out_write(const uint8_t *pcm, size_t bytes)
+static void out_write(const uint8_t *pcm, size_t bytes, uint32_t max_ms)
 {
+    size_t rate_bytes_per_ms = (s_msbc ? 16000 : 8000) * 2 / 1000;
+    size_t max_bytes = max_ms * rate_bytes_per_ms;
     xSemaphoreTake(s_out_lock, portMAX_DELAY);
-    if (xRingbufferGetCurFreeSize(s_sco_out) < bytes) {
-        s_st.rx_late++;           /* overrun: drop the newest frame */
-    } else {
+    /* drop the oldest audio until the new frame fits under the cap: latency beats completeness here */
+    size_t used = SCO_OUT_BYTES - xRingbufferGetCurFreeSize(s_sco_out);
+    while (used + bytes > max_bytes) {
+        size_t n = 0;
+        uint8_t *p = xRingbufferReceiveUpTo(s_sco_out, &n, 0, used + bytes - max_bytes);
+        if (!p) break;
+        vRingbufferReturnItem(s_sco_out, p);
+        used -= n;
+        s_st.rx_late++;
+    }
+    if (xRingbufferGetCurFreeSize(s_sco_out) >= bytes) {
         xRingbufferSend(s_sco_out, pcm, bytes, 0);
     }
     xSemaphoreGive(s_out_lock);
@@ -153,6 +169,7 @@ static void out_prefill_if_empty(void)
 uint32_t audio_pipe_sco_out(uint8_t *pcm, uint32_t bytes)
 {
     uint32_t got = 0;
+    s_st.sco_out_bytes += bytes;
     if (xSemaphoreTake(s_out_lock, pdMS_TO_TICKS(5)) != pdTRUE) {
         memset(pcm, 0, bytes);
         s_st.underruns++;
@@ -180,8 +197,9 @@ uint32_t audio_pipe_sco_out(uint8_t *pcm, uint32_t bytes)
 
 void audio_pipe_sco_in(const uint8_t *pcm, uint32_t bytes)
 {
+    s_st.sco_in_bytes += bytes;
     if (s_loopback) {
-        out_write(pcm, bytes);
+        out_write(pcm, bytes, LOOPBACK_MAX_MS);
     }
     if (xRingbufferSend(s_sco_in, pcm, bytes, 0) != pdTRUE) {
         s_st.sco_drops++;
@@ -228,6 +246,7 @@ void audio_pipe_call_state(uint8_t state)
 
 void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
 {
+    s_st.link_rx_bytes += len;
     if (len < FRAME_HDR) {
         return;
     }
@@ -255,7 +274,7 @@ void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
     if (n * 2 > sizeof pcm / sizeof pcm[0]) n = sizeof pcm / sizeof pcm[0] / 2;
     adpcm_decode(&st, f + FRAME_HDR, n, pcm);
     out_prefill_if_empty();
-    out_write((uint8_t *)pcm, n * 4);
+    out_write((uint8_t *)pcm, n * 4, JITTER_MAX_MS);
 }
 
 void audio_pipe_control(const uint8_t *m, uint16_t len)
@@ -280,6 +299,7 @@ void audio_pipe_control(const uint8_t *m, uint16_t len)
         break;
     }
     case CTRL_BLAST: if (len >= 2) s_blast = m[1] != 0; break;
+    case CTRL_SPP_BATCH: if (len >= 2) audio_pipe_set_spp_batch(m[1]); break;
     default: ESP_LOGW(TAG, "unknown control 0x%02x", m[0]);
     }
 }
@@ -322,7 +342,8 @@ void audio_pipe_print_stats(void)
     printf("tx_frames=%" PRIu32 " tx_dropped=%" PRIu32 " rx_frames=%" PRIu32 " rx_lost=%" PRIu32
            " rx_late=%" PRIu32 " sco_drops=%" PRIu32 " underruns=%" PRIu32 "\n",
            s_st.tx_frames, s_st.tx_dropped, s_st.rx_frames, s_st.rx_lost, s_st.rx_late, s_st.sco_drops, s_st.underruns);
-    printf("spp_write_failures=%" PRIu32 "\n", spp_link_write_failures());
+    printf("spp_write_failures=%" PRIu32 " sco_in_bytes=%" PRIu32 " sco_out_bytes=%" PRIu32 " link_rx_bytes=%" PRIu32 " uptime_ms=%" PRIu32 "\n",
+           spp_link_write_failures(), s_st.sco_in_bytes, s_st.sco_out_bytes, s_st.link_rx_bytes, (uint32_t)(esp_timer_get_time() / 1000));
 }
 
 /* ---- pipeline task (core 1): SCO in -> ADPCM -> BLE ---- */

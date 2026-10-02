@@ -199,8 +199,10 @@ static void register_callbridge_cmds(void)
 
 /* Reconnect HFP to the most recently bonded phone. Runs in its own task because connecting
  * from inside the HF init callback fails immediately; a short delay plus a few retries works. */
+static volatile bool s_reconnecting = false;
 static void reconnect_task(void *arg)
 {
+    s_reconnecting = true;
     /* Android re-pages a lost headset itself within a few seconds. If we page at the same time the
      * two collide ("HF Client found collision") and Bluedroid backs off for ~60 s. So give the phone
      * 10 s to come to us first, then page every 10 s for two minutes. */
@@ -216,7 +218,15 @@ static void reconnect_task(void *arg)
         ESP_LOGI(BT_HF_TAG, "reconnect attempt %d to %02x:%02x:%02x:%02x:%02x:%02x: %s", attempt + 1,
                  peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5], esp_err_to_name(err));
     }
+    s_reconnecting = false;
     vTaskDelete(NULL);
+}
+
+/* also used after a runtime link loss (phone's Bluetooth toggled, out of range) */
+void bt_app_hf_start_reconnect(void)
+{
+    if (s_reconnecting) return;
+    xTaskCreate(reconnect_task, "hf_reconnect", 3072, NULL, 5, NULL);
 }
 
 void bt_app_hf_reconnect_bonded(void)
@@ -230,7 +240,7 @@ void bt_app_hf_reconnect_bonded(void)
         return;
     }
     memcpy(peer_addr, list[0], ESP_BD_ADDR_LEN);
-    xTaskCreate(reconnect_task, "hf_reconnect", 3072, NULL, 5, NULL);
+    bt_app_hf_start_reconnect();
 }
 
 void app_main(void)
@@ -269,7 +279,8 @@ void app_main(void)
         return;
     }
 
-    ESP_LOGI(BT_HF_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
+    ESP_LOGI(BT_HF_TAG, "Own address:[%s], last reset reason %d (1 power-on, 3 sw, 4 panic, 5/6/7 watchdog, 9 brownout)",
+             bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)), esp_reset_reason());
     /* create application task */
     bt_app_task_start_up();
 

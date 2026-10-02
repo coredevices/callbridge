@@ -29,6 +29,7 @@ data class Stats(
     val downDropped: Long = 0,                       // server frames dropped because BLE could not keep up
     val esp: EspStats? = null, val callState: String = "idle",
     val bleKbps: Double = 0.0, val bleFramesPerSec: Int = 0,   // measured on audio_tx over the last second
+    val linkFramesRead: Long = 0, val maxWsSendMs: Double = 0.0, // diagnostics: link reader count, slowest WS send last second
 )
 
 /**
@@ -148,20 +149,25 @@ class Session(private val scope: CoroutineScope) {
         }
         val bytesThisSec = AtomicLong(0L)
         val framesThisSec = AtomicInt(0)
+        var maxSendMs = 0.0
         bleJobs += guardedBle(t) {
             t.audioIn().collect { raw ->
                 bytesThisSec.addAndFetch(raw.size.toLong()); framesThisSec.addAndFetch(1)
                 val f = Frame.decode(raw) ?: return@collect
                 if (f.codec == Frame.CODEC_BLAST) return@collect   // throughput test frames: counted, not relayed
                 lastSeqFromEsp = account(lastSeqFromEsp, f.seq) { lost -> _stats.update { it.copy(espToServer = it.espToServer + 1, lostFromEsp = it.lostFromEsp + lost, levelUp = peak(f)) } }
+                val t0 = nowMs()
                 serverClient?.sendAudio(raw)
+                val dt = nowMs() - t0
+                if (dt > maxSendMs) maxSendMs = dt
             }
         }
         bleJobs += guardedBle(t) {
             while (true) {
                 delay(1_000)
                 val b = bytesThisSec.exchange(0L); val n = framesThisSec.exchange(0)
-                _stats.update { it.copy(bleKbps = b * 8 / 1000.0, bleFramesPerSec = n) }
+                val m = maxSendMs; maxSendMs = 0.0
+                _stats.update { it.copy(bleKbps = b * 8 / 1000.0, bleFramesPerSec = n, linkFramesRead = t.framesReadCount, maxWsSendMs = m) }
             }
         }
         bleJobs += guardedBle(t) {

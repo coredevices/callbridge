@@ -211,15 +211,12 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
             s_hf_connected = param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
             if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_DISCONNECTED) {
                 audio_pipe_hfp_disconnected();
+                bt_app_hf_start_reconnect();   /* link lost at runtime: page the phone again (10 s cadence) */
             }
             if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED) {
                 link_policy_apply(param->conn_stat.remote_bda);   /* the ACL is up now; keep it out of sniff */
             }
-            if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
-                /* the phone scales SCO audio by the headset volume; max it so the uplink level is usable */
-                esp_hf_client_volume_update(ESP_HF_VOLUME_CONTROL_TARGET_SPK, 15);
-                esp_hf_client_volume_update(ESP_HF_VOLUME_CONTROL_TARGET_MIC, 15);
-            }
+            /* (volume_update to 15 at SLC was tried here: no effect on the uplink level, so it stays out) */
             s_hf_connecting = param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTING ||
                               param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED;
             break;

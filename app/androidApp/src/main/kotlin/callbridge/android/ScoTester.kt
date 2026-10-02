@@ -35,6 +35,8 @@ class ScoTester(private val context: Context) {
     private var track: AudioTrack? = null
 
     val isOpen get() = rec != null
+    /** Low-latency audio objects (small buffers, PERFORMANCE_MODE_LOW_LATENCY); toggled by the `lowlat`/`nolowlat` commands. */
+    @Volatile var lowLatency = true
 
     /** Routes communication audio to SCO and starts streaming. Throws with a readable message on failure. */
     suspend fun open(): Unit = withContext(Dispatchers.IO) {
@@ -49,17 +51,23 @@ class ScoTester(private val context: Context) {
             try {
                 am.mode = AudioManager.MODE_IN_COMMUNICATION
                 if (!am.setCommunicationDevice(dev)) error("setCommunicationDevice refused")
-                // the tone we play is scaled by the voice-call volume; at its default it reaches the ESP32 ~43 dB down
-                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0)
+                // (STREAM_VOICE_CALL to max was tried here: no gain on the uplink level, +160 ms SCO round trip; left out)
                 val minRec = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                 @Suppress("MissingPermission")
-                r = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minRec * 4)
+                r = AudioRecord.Builder()
+                    .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                    .setAudioFormat(AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
+                    .setBufferSizeInBytes(minRec * (if (lowLatency) 1 else 4))
+                    .build()
                 if (r.state != AudioRecord.STATE_INITIALIZED) error("AudioRecord init failed")
-                t = AudioTrack.Builder()
+                val tb = AudioTrack.Builder()
                     .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
                     .setAudioFormat(AudioFormat.Builder().setSampleRate(RATE).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
                     .setBufferSizeInBytes(AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT))
-                    .setTransferMode(AudioTrack.MODE_STREAM).build()
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                if (lowLatency) tb.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                t = tb.build()
+                println("callbridge sco: lowLatency=$lowLatency track buf=${t.bufferSizeInFrames} frames, record buf=${r.bufferSizeInFrames} frames")
                 if (t.state != AudioTrack.STATE_INITIALIZED) error("AudioTrack init failed")
                 r.startRecording(); t.play()
                 if (r.recordingState != AudioRecord.RECORDSTATE_RECORDING) error("recording did not start")
