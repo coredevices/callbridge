@@ -174,6 +174,35 @@ class ScoTester(private val context: Context) {
         }
     }
 
+    /**
+     * Phone-side echo: everything that arrives on the SCO link (the far end's voice, via the dongle)
+     * is played straight back into the SCO link, so a far end hears itself through the whole chain.
+     * Runs until [stopEcho]; holds the lock, so measurements wait. Turn the dongle's own loopback
+     * off first or the audio doubles up.
+     */
+    @Volatile private var echoing = false
+    suspend fun startEcho() = withContext(Dispatchers.IO) {
+        lock.withLock {
+            val r = rec ?: return@withLock
+            val t = track ?: return@withLock
+            echoing = true
+            val buf = ShortArray(CHUNK)
+            drain(r, buf)
+            try {
+                while (echoing) {
+                    val n = r.read(buf, 0, buf.size)
+                    if (n <= 0) break
+                    t.write(buf, 0, n)
+                }
+            } finally {
+                echoing = false
+                if (closeRequested) closeLocked()
+            }
+        }
+    }
+    fun stopEcho() { echoing = false }
+    val isEchoing get() = echoing
+
     /** Non-blocking reads until the recorder has nothing queued. */
     private fun drain(r: AudioRecord, buf: ShortArray) {
         while (r.read(buf, 0, buf.size, AudioRecord.READ_NON_BLOCKING) > 0) { /* discard */ }

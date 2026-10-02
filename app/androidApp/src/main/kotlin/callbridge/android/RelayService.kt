@@ -58,6 +58,9 @@ class RelayService : Service() {
                         "disconnect" -> { session.disconnectBle(); "ok" }
                         "relay" -> { session.connectServer(url, "echo", "demo", 0); session.server.value.toString() }
                         "relayroom" -> { session.connectServer(url, "room", "solo", 0); session.server.value.toString() }
+                        "scoecho" -> { if (!sco.isOpen) sco.open(); scope.launch { sco.startEcho() }; "phone echoes SCO (dongle loopback should be off)" }
+                        "unscoecho" -> { sco.stopEcho(); "echo off" }
+                        "room" -> { session.connectServer(url, "room", intent.getStringExtra("room") ?: "demo", 0); session.server.value.toString() }
                         "unrelay" -> { session.disconnectServer(); "ok" }
                         "sco" -> { sco.open(); "sco open" }
                         "unsco" -> { sco.close(); "sco closed" }

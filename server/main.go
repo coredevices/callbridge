@@ -23,6 +23,9 @@ import (
 //go:embed index.html
 var indexHTML []byte
 
+//go:embed far.html
+var farHTML []byte
+
 type hello struct {
 	Type    string `json:"type"`
 	Mode    string `json:"mode"`
@@ -332,6 +335,10 @@ func main() {
 	http.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"clients": st.snapshot(), "now": time.Now().UnixMilli()})
+	})
+	http.HandleFunc("/far", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(farHTML)
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path != "/" {

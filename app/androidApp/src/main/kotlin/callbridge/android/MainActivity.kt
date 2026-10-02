@@ -157,7 +157,15 @@ fun Screen(service: RelayService) {
                 }
             })
         }
-        Button(enabled = scoOpen && !scoBusy, onClick = {
+        var phoneEcho by remember { mutableStateOf(false) }
+        Row {
+            Text("Phone echoes SCO back (far end hears itself; turn ESP loopback off)")
+            Switch(phoneEcho, enabled = scoOpen && !scoBusy, onCheckedChange = { on ->
+                phoneEcho = on
+                if (on) scope.launch { sco.startEcho() } else sco.stopEcho()
+            })
+        }
+        Button(enabled = scoOpen && !scoBusy && !phoneEcho, onClick = {
             scope.launch {
                 scoBusy = true
                 scoStatus = "measuring…"
