@@ -80,9 +80,14 @@ Two link-level facts shape this path (measured, not from the datasheet):
 - Both Bluedroid stacks put an idle HFP ACL into **sniff mode** (495 ms
   interval); ACL data then moves only at anchor points. Firmware removes sniff
   from its link policy (`link_policy.c`).
-- With SCO active the link carries on the order of **25–50 packets/s total**,
-  regardless of packet size, so both ends batch 3 audio frames per SPP write
-  (+40 ms latency). Full-duplex traffic still exceeds the budget today.
+- Both ends batch 3 audio frames per SPP write (+40 ms latency); the phone
+  sends a no-op control message (0x18) every 20 ms so RFCOMM credits for the
+  uplink ride along with data.
+- **Open issue:** the Pixel 9 Pro withholds RFCOMM credits for the uplink in
+  phases of 20–40 s (ESP-side `stats` shows `credit_tx=0` with an empty queue
+  and a free controller window). Uplink then drops to 5–20 frames/s with no
+  gaps (frames are refused, not lost). BLE notifications sidestep credits but
+  only reached 20 frames/s. Not resolved yet; see firmware/README.md.
 
 Stream framing, both directions (several records may share one write):
 

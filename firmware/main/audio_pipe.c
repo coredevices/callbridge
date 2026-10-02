@@ -13,6 +13,7 @@
 #include "adpcm.h"
 #include "ble_gatt.h"
 #include "spp_link.h"
+#include "link_policy.h"
 
 static const char *TAG = "PIPE";
 
@@ -35,6 +36,7 @@ static const char *TAG = "PIPE";
 #define CTRL_PING        0x15
 #define CTRL_BLAST       0x16
 #define CTRL_SPP_BATCH   0x17   /* u8 frames per SPP write (1..4) */
+#define CTRL_KEEPALIVE   0x18   /* no-op; the phone sends it to keep RFCOMM credits flowing */
 
 /* ring sizes: sco_in holds 100 ms, sco_out (jitter buffer) 400 ms, both at 16 kHz */
 #define SCO_IN_BYTES     (16000 * 2 / 10)
@@ -300,6 +302,7 @@ void audio_pipe_control(const uint8_t *m, uint16_t len)
     }
     case CTRL_BLAST: if (len >= 2) s_blast = m[1] != 0; break;
     case CTRL_SPP_BATCH: if (len >= 2) audio_pipe_set_spp_batch(m[1]); break;
+    case CTRL_KEEPALIVE: break;
     default: ESP_LOGW(TAG, "unknown control 0x%02x", m[0]);
     }
 }
@@ -342,6 +345,7 @@ void audio_pipe_print_stats(void)
     printf("tx_frames=%" PRIu32 " tx_dropped=%" PRIu32 " rx_frames=%" PRIu32 " rx_lost=%" PRIu32
            " rx_late=%" PRIu32 " sco_drops=%" PRIu32 " underruns=%" PRIu32 "\n",
            s_st.tx_frames, s_st.tx_dropped, s_st.rx_frames, s_st.rx_lost, s_st.rx_late, s_st.sco_drops, s_st.underruns);
+    link_policy_print_window();
     printf("spp_write_failures=%" PRIu32 " sco_in_bytes=%" PRIu32 " sco_out_bytes=%" PRIu32 " link_rx_bytes=%" PRIu32 " uptime_ms=%" PRIu32 "\n",
            spp_link_write_failures(), s_st.sco_in_bytes, s_st.sco_out_bytes, s_st.link_rx_bytes, (uint32_t)(esp_timer_get_time() / 1000));
 }

@@ -15,5 +15,7 @@ target_include_directories(${COMPONENT_LIB} PRIVATE
     ${bt_dir}/host/bluedroid/stack/include
     ${bt_dir}/host/bluedroid/common/include
     ${bt_dir}/host/bluedroid/bta/include
+    ${bt_dir}/host/bluedroid/stack/l2cap/include
+    ${bt_dir}/host/bluedroid/stack/rfcomm/include
     ${bt_dir}/common/include
     ${bt_dir}/common/osi/include)

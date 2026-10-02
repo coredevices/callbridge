@@ -14,6 +14,7 @@ object Control {
     const val PING = 0x15
     const val BLAST = 0x16
     const val SPP_BATCH = 0x17
+    const val KEEPALIVE = 0x18
 
     val callStateNames = listOf("idle", "incoming", "dialing", "active", "sco_up")
 
@@ -25,6 +26,8 @@ object Control {
     /** Throughput test: firmware streams max-rate dummy frames (codec 0xFF) while on. */
     fun blast(on: Boolean) = byteArrayOf(BLAST.toByte(), if (on) 1 else 0)
     /** Frames per SPP write on the ESP32 (1..4); the app mirrors it for the downlink. */
+    /** No-op the ESP32 ignores. Sent continuously over SPP so the phone's RFCOMM credits for the uplink ride along with data. */
+    fun keepalive() = byteArrayOf(KEEPALIVE.toByte())
     fun sppBatch(n: Int) = byteArrayOf(SPP_BATCH.toByte(), n.coerceIn(1, 4).toByte())
     /** Ping carries a u32 LE token; the pong echoes it. */
     fun ping(token: Int) = byteArrayOf(PING.toByte(), token.toByte(), (token shr 8).toByte(), (token shr 16).toByte(), (token shr 24).toByte())

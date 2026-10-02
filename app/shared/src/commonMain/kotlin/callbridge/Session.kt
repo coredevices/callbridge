@@ -30,6 +30,7 @@ data class Stats(
     val esp: EspStats? = null, val callState: String = "idle",
     val bleKbps: Double = 0.0, val bleFramesPerSec: Int = 0,   // measured on audio_tx over the last second
     val linkFramesRead: Long = 0, val maxWsSendMs: Double = 0.0, // diagnostics: link reader count, slowest WS send last second
+    val readBlockedMsLastSec: Long = 0,                           // ms of the last second the link reader waited for data
 )
 
 /**
@@ -89,6 +90,8 @@ class Session(private val scope: CoroutineScope) {
     private val downlink = Channel<ByteArray>(capacity = 6, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     /** Frames per link write towards the ESP32 (SPP packet budget is shared with the uplink). */
     var downlinkBatch = 3
+    /** Keepalive period towards the ESP32 over SPP; 0 disables. Applied at connect time. */
+    var keepaliveMs = 20L
     private var serverClient: ServerClient? = null
     private val bleJobs = mutableListOf<Job>()
     private val serverJobs = mutableListOf<Job>()
@@ -102,6 +105,9 @@ class Session(private val scope: CoroutineScope) {
     private val _mtu = MutableStateFlow<Int?>(null)
     val mtu: StateFlow<Int?> = _mtu
 
+    /** When false, connectBle uses the BLE GATT link even where SPP is available (for comparison tests). */
+    var preferSpp = true
+
     /** Connects via a BLE advertisement: SPP to the same address when the platform has it, else GATT. */
     suspend fun connectBle(adv: Advertisement) = lock.withLock {
         if (bleTransport != null) return@withLock
@@ -109,7 +115,7 @@ class Session(private val scope: CoroutineScope) {
         _ble.value = BleState.Connecting(name)
         // BLE is the discovery mechanism; on Android the data goes over Classic SPP when the firmware
         // offers it, and the BLE link is dropped so it does not take radio time from SCO.
-        val t: Link = openSppLink(adv.identifier.toString()) ?: run {
+        val t: Link = (if (preferSpp) openSppLink(adv.identifier.toString()) else null) ?: run {
             val b = BleTransport(adv)
             try {
                 _mtu.value = b.connect()
@@ -150,6 +156,7 @@ class Session(private val scope: CoroutineScope) {
         val bytesThisSec = AtomicLong(0L)
         val framesThisSec = AtomicInt(0)
         var maxSendMs = 0.0
+        var lastBlocked = 0L
         bleJobs += guardedBle(t) {
             t.audioIn().collect { raw ->
                 bytesThisSec.addAndFetch(raw.size.toLong()); framesThisSec.addAndFetch(1)
@@ -167,7 +174,8 @@ class Session(private val scope: CoroutineScope) {
                 delay(1_000)
                 val b = bytesThisSec.exchange(0L); val n = framesThisSec.exchange(0)
                 val m = maxSendMs; maxSendMs = 0.0
-                _stats.update { it.copy(bleKbps = b * 8 / 1000.0, bleFramesPerSec = n, linkFramesRead = t.framesReadCount, maxWsSendMs = m) }
+                val blocked = t.readBlockedMs; val dBlocked = blocked - lastBlocked; lastBlocked = blocked
+                _stats.update { it.copy(bleKbps = b * 8 / 1000.0, bleFramesPerSec = n, linkFramesRead = t.framesReadCount, maxWsSendMs = m, readBlockedMsLastSec = dBlocked) }
             }
         }
         bleJobs += guardedBle(t) {
@@ -181,6 +189,14 @@ class Session(private val scope: CoroutineScope) {
                     while (batch.size < downlinkBatch) batch += downlink.tryReceive().getOrNull() ?: break
                 }
                 t.sendAudioBatch(batch)
+            }
+        }
+        if (t.kind == "spp" && keepaliveMs > 0) bleJobs += guardedBle(t) {
+            // Android hands out RFCOMM credits mostly on its own outgoing frames; with nothing to send the
+            // uplink starves. A steady trickle towards the ESP32 keeps credits flowing. See docs/protocol.md.
+            while (true) {
+                delay(keepaliveMs)
+                try { t.sendControl(Control.keepalive()) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
             }
         }
         bleJobs += guardedBle(t) {

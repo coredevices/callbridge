@@ -7,6 +7,8 @@ interface Link {
     val kind: String
     /** Audio frames the link has read so far (diagnostics); 0 where not tracked. */
     val framesReadCount: Long get() = 0
+    /** Cumulative ms the link reader spent waiting for data (diagnostics). */
+    val readBlockedMs: Long get() = 0
     fun audioIn(): Flow<ByteArray>
     fun controlIn(): Flow<ByteArray>
     suspend fun sendAudio(frame: ByteArray)

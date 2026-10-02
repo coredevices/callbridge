@@ -28,10 +28,13 @@ private const val MAX_PAYLOAD = 1024
 class SppLink private constructor(private val socket: BluetoothSocket) : Link {
     override val kind = "spp"
     override val framesReadCount: Long get() = framesRead
+    override val readBlockedMs: Long get() = readBlockedNs / 1_000_000
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val audio = Channel<ByteArray>(capacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     /** Frames read from the socket; compare with what the consumer got to spot consumer stalls. */
     @Volatile var framesRead = 0L
+    /** Nanoseconds the reader spent blocked waiting for socket data (if ~1 s per second, the phone has no data for us). */
+    @Volatile var readBlockedNs = 0L
     private val control = Channel<ByteArray>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private val writeLock = Mutex()
     private val out = socket.outputStream
@@ -42,7 +45,9 @@ class SppLink private constructor(private val socket: BluetoothSocket) : Link {
             val hdr = ByteArray(3)
             try {
                 while (true) {
+                    val t0 = System.nanoTime()
                     input.readFully(hdr)
+                    readBlockedNs += System.nanoTime() - t0
                     val ch = hdr[0].toInt() and 0xff
                     val len = (hdr[1].toInt() and 0xff) or ((hdr[2].toInt() and 0xff) shl 8)
                     if (len > MAX_PAYLOAD) throw IOException("bad frame length $len")

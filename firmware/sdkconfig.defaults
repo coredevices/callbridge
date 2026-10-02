@@ -55,3 +55,8 @@ CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
 
 # crash -> reboot (the HFP link then comes back by itself) and keep the reason for the boot log
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# Controller must never doze: modem sleep made uplink delivery collapse to ~10 frames/s in ~30 s phases.
+CONFIG_BTDM_CTRL_MODEM_SLEEP=n
+# SCO data over HCI in the controller too (host HFP path is HCI)
+CONFIG_BTDM_CTRL_BR_EDR_SCO_DATA_PATH_HCI=y

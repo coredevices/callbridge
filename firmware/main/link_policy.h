@@ -9,3 +9,4 @@
  */
 void link_policy_init(void);
 void link_policy_apply(const uint8_t *bda);
+void link_policy_print_window(void);

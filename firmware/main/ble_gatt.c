@@ -94,9 +94,18 @@ static volatile bool s_advertising = false;
 
 /* Advertising sometimes silently fails to start at boot (races with Classic scan-mode setup), so a
  * watchdog restarts it whenever we are neither connected nor advertising. */
+/* BLE advertising takes radio time from the Classic link; off by default while SPP is the data path.
+ * Console `adv 1` turns it on (needed for BLE/iOS discovery). */
+static volatile bool s_adv_enabled = true;
+void ble_gatt_set_advertising(bool on)
+{
+    s_adv_enabled = on;
+    if (!on && s_advertising) esp_ble_gap_stop_advertising();
+}
+
 static void adv_watchdog(void *arg)
 {
-    if (s_conn_id == 0xffff && !s_advertising && s_adv_config_pending == 0) {
+    if (s_adv_enabled && s_conn_id == 0xffff && !s_advertising && s_adv_config_pending == 0) {
         esp_ble_gap_start_advertising(&adv_params);
     }
 }
@@ -107,7 +116,7 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
     case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
         ESP_LOGI(TAG, "adv/scan-rsp data set (event %d, status %d), pending %d", event, param->adv_data_cmpl.status, s_adv_config_pending - 1);
-        if (--s_adv_config_pending == 0) {
+        if (--s_adv_config_pending == 0 && s_adv_enabled) {
             esp_err_t e = esp_ble_gap_start_advertising(&adv_params);
             if (e) ESP_LOGE(TAG, "start advertising: %s", esp_err_to_name(e));
         }
@@ -190,7 +199,7 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
         s_conn_id = 0xffff;
         s_tx_subscribed = s_ctl_subscribed = false;
         audio_pipe_ble_state(false);
-        esp_ble_gap_start_advertising(&adv_params);
+        if (s_adv_enabled) esp_ble_gap_start_advertising(&adv_params);
         break;
     case ESP_GATTS_MTU_EVT:
         s_mtu = param->mtu.mtu;

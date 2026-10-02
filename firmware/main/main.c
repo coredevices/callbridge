@@ -144,6 +144,9 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
         break;
 #endif
 
+    case ESP_BT_GAP_QOS_CMPL_EVT:
+        ESP_LOGI(BT_HF_TAG, "qos complete: status %d, t_poll %" PRIu32, param->qos_cmpl.stat, param->qos_cmpl.t_poll);
+        break;
     case ESP_BT_GAP_MODE_CHG_EVT:
         ESP_LOGI(BT_HF_TAG, "ESP_BT_GAP_MODE_CHG_EVT mode:%d", param->mode_chg.mode);
         break;
@@ -177,6 +180,11 @@ static int cmd_batch(int argc, char **argv)
     if (argc >= 2) audio_pipe_set_spp_batch(atoi(argv[1]));
     return 0;
 }
+static int cmd_adv(int argc, char **argv)
+{
+    if (argc >= 2) ble_gatt_set_advertising(argv[1][0] != '0');
+    return 0;
+}
 static int cmd_top(int argc, char **argv)
 {
     static char buf[2048];
@@ -192,6 +200,8 @@ static void register_callbridge_cmds(void)
     const esp_console_cmd_t top = { .command = "top", .help = "per-task CPU time", .func = &cmd_top };
     const esp_console_cmd_t batch = { .command = "batch", .help = "batch <n>: audio frames per SPP write", .func = &cmd_batch };
     ESP_ERROR_CHECK(esp_console_cmd_register(&batch));
+    const esp_console_cmd_t adv = { .command = "adv", .help = "adv <0|1>: BLE advertising off/on", .func = &cmd_adv };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&adv));
     ESP_ERROR_CHECK(esp_console_cmd_register(&lb));
     ESP_ERROR_CHECK(esp_console_cmd_register(&st));
     ESP_ERROR_CHECK(esp_console_cmd_register(&top));

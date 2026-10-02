@@ -5,6 +5,9 @@
 #include "common/bt_target.h"
 #include "stack/btm_api.h"
 #include "stack/hcidefs.h"
+#include "l2c_int.h"
+#include "rfc_int.h"
+#include "port_int.h"
 
 static const char *TAG = "LINKPOL";
 
@@ -37,4 +40,21 @@ void link_policy_apply(const uint8_t *bda)
     tBTM_STATUS st2 = BTM_SetPowerMode(s_pm_id, (UINT8 *)bda, &md);
     ESP_LOGI(TAG, "link policy 0x%04x + active mode on %02x:%02x:%02x:%02x:%02x:%02x -> %d / %d", POLICY,
              bda[0], bda[1], bda[2], bda[3], bda[4], bda[5], st, st2);
+}
+
+/* Diagnostics: how many ACL packets the controller can still accept. Zero means the controller is
+ * holding packets the phone has not acknowledged (air-side stall); a healthy window with a growing
+ * host queue means the host is not feeding the controller. */
+void link_policy_print_window(void)
+{
+    extern tL2C_CB l2cb;
+    printf("l2cap: xmit_window=%u of %u acl bufs, round_robin_quota=%u\n",
+           (unsigned)l2cb.controller_xmit_window, (unsigned)l2cb.num_lm_acl_bufs, (unsigned)l2cb.round_robin_quota);
+    for (int i = 0; i < MAX_RFC_PORTS; i++) {
+        tPORT *p = &rfc_cb.port.port[i];
+        if (!p->in_use) continue;
+        printf("rfcomm port %d: state %d credit_tx=%u credit_rx=%u tx_queue=%u bytes/%u bufs rx_queue=%u bytes peer_mtu=%u\n",
+               i, p->state, p->credit_tx, p->credit_rx, (unsigned)p->tx.queue_size, (unsigned)fixed_queue_length(p->tx.queue),
+               (unsigned)p->rx.queue_size, p->peer_mtu);
+    }
 }

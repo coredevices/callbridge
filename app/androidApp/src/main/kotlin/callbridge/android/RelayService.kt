@@ -53,7 +53,8 @@ class RelayService : Service() {
             scope.launch {
                 val result = runCatching {
                     when (cmd) {
-                        "connect" -> { connectAny(); session.ble.value.toString() }
+                        "connect" -> { session.preferSpp = true; connectAny(); session.ble.value.toString() }
+                        "connectble" -> { session.preferSpp = false; val adv = withTimeout(10_000) { scanCallbridge().first() }; session.connectBle(adv); session.ble.value.toString() }
                         "disconnect" -> { session.disconnectBle(); "ok" }
                         "relay" -> { session.connectServer(url, "echo", "demo", 0); session.server.value.toString() }
                         "relayroom" -> { session.connectServer(url, "room", "solo", 0); session.server.value.toString() }
@@ -69,6 +70,7 @@ class RelayService : Service() {
                             val n = cmd.last().digitToInt(); session.downlinkBatch = n
                             "batch $n: esp ${session.sendControl(Control.sppBatch(n))}"
                         }
+                        "ka0", "ka20", "ka50", "ka100" -> { session.keepaliveMs = cmd.removePrefix("ka").toLong(); "keepalive ${session.keepaliveMs} ms (reconnect to apply)" }
                         "lowlat" -> { sco.lowLatency = true; "lowLatency on (reopen sco)" }
                         "nolowlat" -> { sco.lowLatency = false; "lowLatency off (reopen sco)" }
                         "unloopback" -> { session.loopbackWanted = false; "loopback off ${session.sendControl(Control.loopback(false))}" }
@@ -99,7 +101,7 @@ class RelayService : Service() {
                 delay(1_000)
                 val s = session.stats.value; val l = session.latency.value
                 Log.i("callbridge", "ble=${session.ble.value} server=${session.server.value} mtu=${session.mtu.value} " +
-                    "rx ${s.bleFramesPerSec} f/s ${"%.1f".format(s.bleKbps)} kbps linkRead=${s.linkFramesRead} maxWsSend=${"%.0f".format(s.maxWsSendMs)}ms up=${s.espToServer}/lost ${s.lostFromEsp} peakUp=${s.levelUp} down=${s.serverToEsp}/lost ${s.lostFromServer} peakDown=${s.levelDown} " +
+                    "rx ${s.bleFramesPerSec} f/s ${"%.1f".format(s.bleKbps)} kbps linkRead=${s.linkFramesRead} maxWsSend=${"%.0f".format(s.maxWsSendMs)}ms readWait=${s.readBlockedMsLastSec}ms up=${s.espToServer}/lost ${s.lostFromEsp} peakUp=${s.levelUp} down=${s.serverToEsp}/lost ${s.lostFromServer} peakDown=${s.levelDown} " +
                     "call=${s.callState} esp=${s.esp?.let { "tx ${it.txFrames} rx ${it.rxFrames} lost ${it.rxLost} late ${it.rxLate} scodrop ${it.scoDrops}" }} " +
                     "lat sco=${l.scoRtMs} ble=${l.bleRtMs} ws=${l.wsRtMs} up=${l.upMs} down=${l.downMs} full=${l.fullRtMs}")
             }

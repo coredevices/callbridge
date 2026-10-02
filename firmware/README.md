@@ -30,3 +30,20 @@ control messages), `spp_link.c` (Classic SPP server, the Android data path),
 `ble_gatt.c` (GATT service, iOS/discovery path), `link_policy.c` (keeps the
 ACL out of sniff mode via Bluedroid internals; without it ACL data crawls at
 ~10 packets/s while HFP is up), `adpcm.c`. Protocol in `../docs/protocol.md`.
+
+## Link findings (2026-10-01/02)
+
+Measured with the app's adb command channel (`cmd.sh` in the session notes) and
+the `stats`/`top` console commands:
+
+- Sniff mode (phone and our own BTA) collapsed ACL throughput; `link_policy.c`
+  removes sniff from the link policy and registers a BTM power-manager client
+  that asks for ACTIVE, which stops BTA from retrying a rejected sniff command
+  every 50 ms.
+- Controller modem sleep is off; SCO data path HCI on both host and controller.
+- SPP frames are batched (3 per write, `batch <n>`); the phone sends a 20 ms
+  keepalive so credits piggyback.
+- Remaining problem: the phone grants ~10 RFCOMM credits then withholds them
+  for 20–40 s at a time (`credit_tx=0`, `tx_queue=0`, `xmit_window=9/9`),
+  so the uplink alternates between ~50 and ~5–20 frames/s. Phone Wi-Fi on
+  makes it worse (coexistence). Not solved.
