@@ -90,6 +90,9 @@ class Session(private val scope: CoroutineScope) {
     private val downlink = Channel<ByteArray>(capacity = 6, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     /** Frames per link write towards the ESP32 (SPP packet budget is shared with the uplink). */
     var downlinkBatch = 3
+    /** Test aid: frames from the server are sent straight back to the server instead of to the ESP32. */
+    @Volatile var appEcho = false
+
     /** Keepalive period towards the ESP32 over SPP; 0 disables. Applied at connect time. */
     var keepaliveMs = 20L
     private var serverClient: ServerClient? = null
@@ -233,7 +236,7 @@ class Session(private val scope: CoroutineScope) {
             s.audioIn().collect { raw ->
                 val f = Frame.decode(raw) ?: return@collect
                 lastSeqFromServer = account(lastSeqFromServer, f.seq) { lost -> _stats.update { it.copy(serverToEsp = it.serverToEsp + 1, lostFromServer = it.lostFromServer + lost, levelDown = peak(f)) } }
-                if (bleTransport != null) downlink.trySend(raw)
+                if (appEcho) s.sendAudio(raw) else if (bleTransport != null) downlink.trySend(raw)
             }
             error("server closed the connection")
         }

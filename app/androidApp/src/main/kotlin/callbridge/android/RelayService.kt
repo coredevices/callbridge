@@ -58,6 +58,8 @@ class RelayService : Service() {
                         "disconnect" -> { session.disconnectBle(); "ok" }
                         "relay" -> { session.connectServer(url, "echo", "demo", 0); session.server.value.toString() }
                         "relayroom" -> { session.connectServer(url, "room", "solo", 0); session.server.value.toString() }
+                        "appecho" -> { session.appEcho = true; if (session.server.value !is callbridge.ServerState.Connected) session.connectServer(url, "room", intent.getStringExtra("room") ?: "demo", 0); "app echoes server audio back (room ${intent.getStringExtra("room") ?: "demo"})" }
+                        "unappecho" -> { session.appEcho = false; "app echo off" }
                         "scoecho" -> { if (!sco.isOpen) sco.open(); scope.launch { sco.startEcho() }; "phone echoes SCO (dongle loopback should be off)" }
                         "unscoecho" -> { sco.stopEcho(); "echo off" }
                         "room" -> { session.connectServer(url, "room", intent.getStringExtra("room") ?: "demo", 0); session.server.value.toString() }

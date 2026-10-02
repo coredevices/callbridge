@@ -28,8 +28,14 @@
   <p class="sub">Your laptop's mic and speaker as the other side of the call. Joins a room; the phone app joins the same room in room mode.</p>
 
   <div class="row">
+    <label>Echo at <select id="echoat">
+      <option value="server">server only (no phone)</option>
+      <option value="app">phone app (no dongle): run scripts/cmd.sh appecho</option>
+      <option value="full" selected>dongle + phone (full path): scripts/cmd.sh scoecho</option>
+    </select></label>
     <label>Room <input id="room" value="demo" size="10"></label>
     <label>Jitter target <select id="jitter"><option value="40">40 ms</option><option value="60" selected>60 ms</option><option value="100">100 ms</option></select></label>
+    <label>Mic gain <select id="gain"><option value="1">1x</option><option value="2">2x</option><option value="4" selected>4x</option><option value="8">8x</option></select></label>
     <button id="join" class="primary">Join with mic</button>
     <button id="leave" disabled>Leave</button>
     <span id="status" class="stats">idle</span>
@@ -41,6 +47,8 @@
     <div class="label" style="margin-top:12px">Receiving (phone → your speaker)</div>
     <div class="meter"><div id="m-down" style="background:var(--down)"></div></div>
     <div class="stats" id="stats" style="margin-top:10px">–</div>
+    <div class="label" style="margin-top:14px">Last 10 s: level sent (blue) and received (orange). The horizontal offset between a burst and its echo is the round trip.</div>
+    <canvas id="graph" width="1200" height="180" style="width:100%;height:180px;background:var(--surface);border-radius:6px"></canvas>
   </div>
 
   <div class="card how">
@@ -90,7 +98,28 @@
     return pcm;
   }
 
-  let ws, ctx, mic, proc, seq = 0, stats = { tx: 0, rx: 0, lost: 0, under: 0, lastSeq: -1 };
+  let ws, ctx, mic, proc, seq = 0, stats = { tx: 0, rx: 0, lost: 0, under: 0, lastSeq: -1, rxSec: 0, rxRate: 0 };
+  // level history: one sample per 20 ms frame, 10 s window; written by capture (up) and receive (down)
+  const HIST = 500, upHist = new Float32Array(HIST), downHist = new Float32Array(HIST);
+  let histPos = 0, lastDownPeak = 0;
+  function drawGraph() {
+    const c = $('graph'), g = c.getContext('2d'), W = c.width, H = c.height;
+    g.clearRect(0, 0, W, H);
+    g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid'); g.lineWidth = 1;
+    for (let sec = 0; sec <= 10; sec++) { const x = W - sec * W / 10; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); }
+    const draw = (hist, color, mid) => {
+      g.strokeStyle = color; g.lineWidth = 2; g.beginPath();
+      for (let i = 0; i < HIST; i++) {
+        const v = hist[(histPos + i) % HIST], x = i * W / HIST, y = mid - v * (H / 2 - 6);
+        i ? g.lineTo(x, y) : g.moveTo(x, y);
+      }
+      g.stroke();
+    };
+    draw(upHist, getComputedStyle(document.documentElement).getPropertyValue('--up'), H * 0.5 - 2);
+    draw(downHist, getComputedStyle(document.documentElement).getPropertyValue('--down'), H - 4);
+    requestAnimationFrame(drawGraph);
+  }
+  requestAnimationFrame(drawGraph);
   const q = [];          // decoded 8 kHz frames waiting for playback
   let qSamples = 0, started = false;
   const $ = id => document.getElementById(id);
@@ -99,10 +128,12 @@
     const room = $('room').value || 'demo';
     ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', mode: 'room', room, delayMs: 0, name: 'far end' }));
+    const mode = $('echoat').value === 'server' ? 'echo' : 'room';
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'hello', mode, room, delayMs: 0, name: 'far end' }));
     ws.onmessage = e => {
       if (typeof e.data === 'string') {
         const m = JSON.parse(e.data);
+        if (m.type === 'ok') $('status').textContent = mode === 'echo' ? 'server echo: you should hear yourself now' : `in room "${room}", waiting for the phone`;
         if (m.type === 'peer') $('status').textContent = `room "${room}": ${m.count} in room`;
         if (m.type === 'error') $('status').textContent = m.message;
         return;
@@ -117,6 +148,7 @@
       while (qSamples > cap) { const old = q.shift(); qSamples -= old.length; }
       let peak = 0; for (const v of pcm) peak = Math.max(peak, Math.abs(v));
       $('m-down').style.width = (peak / 327.67) + '%';
+      lastDownPeak = peak / 32768; stats.rxSec++;
     };
     ws.onclose = () => { $('status').textContent = 'disconnected'; };
 
@@ -131,12 +163,15 @@
       // --- capture: average groups of `ratio` samples down to 8 kHz, pack 20 ms frames, send
       const inp = ev.inputBuffer.getChannelData(0);
       let peak = 0;
+      const gain = Number($('gain').value);
       for (let i = 0; i < inp.length; i += ratio) {
         let sum = 0; for (let k = 0; k < ratio; k++) sum += inp[i + k] || 0;
-        const v = Math.max(-32768, Math.min(32767, Math.round(sum / ratio * 32767)));
+        const v = Math.max(-32768, Math.min(32767, Math.round(sum / ratio * gain * 32767)));
         acc[accN++] = v; peak = Math.max(peak, Math.abs(v));
         if (accN === FRAME) {
           if (ws && ws.readyState === 1) { ws.send(encodeFrame(acc, seq)); seq = (seq + 1) & 0xffff; stats.tx++; }
+          let fp = 0; for (let k = 0; k < FRAME; k++) fp = Math.max(fp, Math.abs(acc[k]));
+          upHist[histPos] = fp / 32768; downHist[histPos] = lastDownPeak; lastDownPeak = 0; histPos = (histPos + 1) % HIST;
           accN = 0;
         }
       }
@@ -160,7 +195,8 @@
     mic.connect(proc); proc.connect(ctx.destination);
     $('join').disabled = true; $('leave').disabled = false;
     $('status').textContent = `joining "${room}"…`;
-    setInterval(() => { $('stats').textContent = `sent ${stats.tx} · received ${stats.rx} · lost ${stats.lost} · buffer ${Math.round(qSamples / 8)} ms · underruns ${stats.under} · audio ${ctx.sampleRate} Hz`; }, 500);
+    setInterval(() => { stats.rxRate = stats.rxSec * 2; stats.rxSec = 0; }, 500);
+    setInterval(() => { $('stats').textContent = `sent ${stats.tx} · received ${stats.rx} (${stats.rxRate}/s, 50 = full) · lost ${stats.lost} · buffer ${Math.round(qSamples / 8)} ms · underruns ${stats.under} · audio ${ctx.sampleRate} Hz`; }, 500);
   }
   function leave() {
     ws && ws.close(); proc && proc.disconnect(); mic && mic.disconnect(); ctx && ctx.close();

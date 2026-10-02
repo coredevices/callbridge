@@ -119,6 +119,8 @@ fun Screen(service: RelayService) {
         OutlinedTextField(serverUrl, { serverUrl = it }, label = { Text("server ws url") }, modifier = Modifier.fillMaxWidth())
         Row { Text("echo mode"); Switch(echo, { echo = it }) }
         if (!echo) OutlinedTextField(room, { room = it }, label = { Text("room") })
+        var appEcho by remember { mutableStateOf(session.appEcho) }
+        Row { Text("App echoes server audio back (test, bypasses dongle)"); Switch(appEcho, { appEcho = it; session.appEcho = it }) }
         if (server is ServerState.Connected) {
             Button(onClick = { scope.launch { session.disconnectServer() } }) { Text("Stop relay") }
         } else {
