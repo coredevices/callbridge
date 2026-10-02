@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -46,7 +47,8 @@ func readBinary(t *testing.T, c *websocket.Conn) []byte {
 
 func TestEchoAndRoom(t *testing.T) {
 	r := &rooms{m: map[string]map[*client]struct{}{}}
-	srv := httptest.NewServer(serveWS(r))
+	st := &statsStore{m: map[string]*clientStats{}}
+	srv := httptest.NewServer(serveWS(r, st))
 	defer srv.Close()
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx := context.Background()
@@ -78,5 +80,61 @@ func TestEchoAndRoom(t *testing.T) {
 	a.Write(ctx, websocket.MessageBinary, []byte{9})
 	if got := readBinary(t, b); string(got) != "\x09" {
 		t.Fatalf("room got %v", got)
+	}
+}
+
+func TestPingAndLatency(t *testing.T) {
+	r := &rooms{m: map[string]map[*client]struct{}{}}
+	st := &statsStore{m: map[string]*clientStats{}}
+	srv := httptest.NewServer(serveWS(r, st))
+	defer srv.Close()
+	url := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ctx := context.Background()
+
+	c := dial(t, url, `{"type":"hello","mode":"echo","name":"pixel"}`)
+	defer c.CloseNow()
+	c.Write(ctx, websocket.MessageText, []byte(`{"type":"ping","t":42}`))
+	_, data, err := c.Read(ctx)
+	if err != nil || !strings.Contains(string(data), `"pong"`) || !strings.Contains(string(data), `42`) {
+		t.Fatalf("pong got %q err=%v", data, err)
+	}
+	c.Write(ctx, websocket.MessageText, []byte(`{"type":"latency","sco_rt_ms":120.5,"ws_rt_ms":30}`))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var cs *clientStats
+		for _, c := range st.snapshot() {
+			if c.Name == "pixel" {
+				cs = c
+			}
+		}
+		if cs != nil && len(cs.History) == 1 {
+			h := cs.History[0]
+			if h.Ble != nil || *h.Sco != 120.5 || *h.Ws != 30 || !cs.Online {
+				t.Fatalf("bad sample %+v", h)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("latency sample not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStatsStoreBounds(t *testing.T) {
+	st := &statsStore{m: map[string]*clientStats{}}
+	for i := 0; i < clientCap+5; i++ {
+		st.record(fmt.Sprintf("c%d", i), clientStats{Online: i%2 == 0}, nil)
+	}
+	if n := len(st.snapshot()); n != clientCap {
+		t.Fatalf("client cap not enforced: %d", n)
+	}
+	bad := 1.7e308
+	if validMs(&bad) != nil {
+		t.Fatal("extreme latency accepted")
+	}
+	neg := -1.0
+	if validMs(&neg) != nil {
+		t.Fatal("negative latency accepted")
 	}
 }

@@ -5,11 +5,13 @@ object Control {
     const val CALL_STATE = 0x01
     const val CODEC = 0x02
     const val STATS = 0x03
+    const val PONG = 0x04
     const val ANSWER = 0x10
     const val HANGUP = 0x11
     const val LOOPBACK = 0x12
     const val DIAL = 0x13
     const val REQUEST_STATS = 0x14
+    const val PING = 0x15
 
     val callStateNames = listOf("idle", "incoming", "dialing", "active", "sco_up")
 
@@ -18,6 +20,10 @@ object Control {
     fun loopback(on: Boolean) = byteArrayOf(LOOPBACK.toByte(), if (on) 1 else 0)
     fun dial(number: String) = byteArrayOf(DIAL.toByte()) + number.encodeToByteArray()
     fun requestStats() = byteArrayOf(REQUEST_STATS.toByte())
+    /** Ping carries a u32 LE token; the pong echoes it. */
+    fun ping(token: Int) = byteArrayOf(PING.toByte(), token.toByte(), (token shr 8).toByte(), (token shr 16).toByte(), (token shr 24).toByte())
+    fun pongToken(msg: ByteArray): Int? = if (msg.size >= 5 && msg[0].toInt() == PONG)
+        (msg[1].toInt() and 0xff) or ((msg[2].toInt() and 0xff) shl 8) or ((msg[3].toInt() and 0xff) shl 16) or ((msg[4].toInt() and 0xff) shl 24) else null
 }
 
 class EspStats(val txFrames: Long, val rxFrames: Long, val rxLost: Long, val rxLate: Long, val scoDrops: Long) {

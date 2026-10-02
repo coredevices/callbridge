@@ -170,6 +170,10 @@ const char *c_inband_ring_state_str[] = {
 };
 
 extern esp_bd_addr_t peer_addr;
+static volatile bool s_hf_connected = false;   /* service-level connection up */
+static volatile bool s_hf_connecting = false;  /* transport up or connecting; don't retry meanwhile */
+bool bt_app_hf_is_connected(void) { return s_hf_connected; }
+bool bt_app_hf_is_connecting(void) { return s_hf_connecting; }
 // If you want to connect a specific device, add it's address here
 // esp_bd_addr_t peer_addr = {0xac, 0x67, 0xb2, 0x53, 0x77, 0xbe};
 
@@ -245,6 +249,9 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
                     param->conn_stat.peer_feat,
                     param->conn_stat.chld_feat);
             memcpy(peer_addr,param->conn_stat.remote_bda,ESP_BD_ADDR_LEN);
+            s_hf_connected = param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED;
+            s_hf_connecting = param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTING ||
+                              param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED;
             break;
         }
 
@@ -405,6 +412,7 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
         {
             if (ESP_HF_INIT_SUCCESS == param->prof_stat.state) {
                 ESP_LOGI(BT_HF_TAG, "HF PROF STATE: Init Complete");
+                bt_app_hf_reconnect_bonded();
             } else if (ESP_HF_DEINIT_SUCCESS == param->prof_stat.state) {
                 ESP_LOGI(BT_HF_TAG, "HF PROF STATE: Deinit Complete");
             } else {

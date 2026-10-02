@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"flag"
 	"log"
@@ -19,11 +20,102 @@ import (
 	"github.com/coder/websocket"
 )
 
+//go:embed index.html
+var indexHTML []byte
+
 type hello struct {
 	Type    string `json:"type"`
 	Mode    string `json:"mode"`
 	Room    string `json:"room"`
 	DelayMs int    `json:"delayMs"`
+	Name    string `json:"name"`
+}
+
+// control is any text message after hello: ping (echoed as pong) or a latency report.
+type control struct {
+	Type string   `json:"type"`
+	T    float64  `json:"t"`
+	Sco  *float64 `json:"sco_rt_ms"`
+	Ble  *float64 `json:"ble_rt_ms"`
+	Ws   *float64 `json:"ws_rt_ms"`
+}
+
+// latencySample is one report from a client; nil sections are unmeasured.
+type latencySample struct {
+	T   int64    `json:"t"` // unix ms, server clock
+	Sco *float64 `json:"sco_rt_ms"`
+	Ble *float64 `json:"ble_rt_ms"`
+	Ws  *float64 `json:"ws_rt_ms"`
+}
+
+type clientStats struct {
+	Name    string          `json:"name"`
+	Mode    string          `json:"mode"`
+	Online  bool            `json:"online"`
+	History []latencySample `json:"history"`
+	seen    int64           // unix ms of last record; eviction order
+}
+
+const (
+	historyCap   = 900   // ~30 min at one report per 2 s
+	clientCap    = 100   // evict the oldest offline client beyond this
+	maxLatencyMs = 60000 // reports outside [0, maxLatencyMs] are dropped
+)
+
+type statsStore struct {
+	mu sync.Mutex
+	m  map[string]*clientStats
+}
+
+func (s *statsStore) record(id string, cs clientStats, smp *latencySample) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.m[id]
+	if c == nil {
+		if len(s.m) >= clientCap {
+			s.evictLocked()
+		}
+		c = &clientStats{History: []latencySample{}}
+		s.m[id] = c
+	}
+	c.Name, c.Mode, c.Online, c.seen = cs.Name, cs.Mode, cs.Online, time.Now().UnixMilli()
+	if smp != nil {
+		c.History = append(c.History, *smp)
+		if len(c.History) > historyCap {
+			c.History = c.History[len(c.History)-historyCap:]
+		}
+	}
+}
+
+// evictLocked drops the least recently seen client, preferring offline ones.
+func (s *statsStore) evictLocked() {
+	var victim string
+	var vs *clientStats
+	for id, c := range s.m {
+		if vs == nil || (!c.Online && vs.Online) || (c.Online == vs.Online && c.seen < vs.seen) {
+			victim, vs = id, c
+		}
+	}
+	delete(s.m, victim)
+}
+
+func validMs(p *float64) *float64 {
+	if p == nil || *p < 0 || *p > maxLatencyMs || *p != *p {
+		return nil
+	}
+	return p
+}
+
+func (s *statsStore) snapshot() map[string]*clientStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*clientStats, len(s.m))
+	for k, v := range s.m {
+		cp := *v
+		cp.History = append([]latencySample(nil), v.History...)
+		out[k] = &cp
+	}
+	return out
 }
 
 type client struct {
@@ -108,7 +200,7 @@ func (c *client) writer(ctx context.Context) {
 	}
 }
 
-func serveWS(r *rooms) http.HandlerFunc {
+func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		conn, err := websocket.Accept(w, req, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
 		if err != nil {
@@ -140,11 +232,29 @@ func serveWS(r *rooms) http.HandlerFunc {
 		}
 		delay := time.Duration(min(max(h.DelayMs, 0), 5000)) * time.Millisecond // bounded: each frame holds a timer until it fires
 		log.Printf("client %s mode=%s room=%q delay=%s", req.RemoteAddr, h.Mode, h.Room, delay)
+		id := req.RemoteAddr // identity; h.Name is only a label
+		st.record(id, clientStats{Name: h.Name, Mode: h.Mode, Online: true}, nil)
+		defer st.record(id, clientStats{Name: h.Name, Mode: h.Mode, Online: false}, nil)
 
 		for {
 			typ, data, err := conn.Read(ctx)
 			if err != nil {
 				return
+			}
+			if typ == websocket.MessageText {
+				var m control
+				if json.Unmarshal(data, &m) != nil {
+					continue
+				}
+				switch m.Type {
+				case "ping":
+					pong, _ := json.Marshal(map[string]any{"type": "pong", "t": m.T})
+					c.send(pong, true)
+				case "latency":
+					st.record(id, clientStats{Name: h.Name, Mode: h.Mode, Online: true},
+						&latencySample{T: time.Now().UnixMilli(), Sco: validMs(m.Sco), Ble: validMs(m.Ble), Ws: validMs(m.Ws)})
+				}
+				continue
 			}
 			if typ != websocket.MessageBinary {
 				continue
@@ -167,7 +277,20 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 	r := &rooms{m: map[string]map[*client]struct{}{}}
-	http.HandleFunc("/ws", serveWS(r))
+	st := &statsStore{m: map[string]*clientStats{}}
+	http.HandleFunc("/ws", serveWS(r, st))
+	http.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"clients": st.snapshot(), "now": time.Now().UnixMilli()})
+	})
+	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/" {
+			http.NotFound(w, req)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
+	})
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	log.Printf("callbridge server listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, nil))

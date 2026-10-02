@@ -159,6 +159,39 @@ enum {
 /* handler for bluetooth stack enabled events */
 static void bt_hf_client_hdl_stack_evt(uint16_t event, void *p_param);
 
+/* Reconnect HFP to the most recently bonded phone. Runs in its own task because connecting
+ * from inside the HF init callback fails immediately; a short delay plus a few retries works. */
+static void reconnect_task(void *arg)
+{
+    for (int attempt = 0; attempt < 5; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(attempt == 0 ? 1500 : 4000));
+        if (bt_app_hf_is_connected()) {
+            break;
+        }
+        if (bt_app_hf_is_connecting()) {
+            continue; /* phone or a previous attempt is mid-negotiation; wait */
+        }
+        ESP_LOGI(BT_HF_TAG, "reconnect attempt %d to %02x:%02x:%02x:%02x:%02x:%02x", attempt + 1,
+                 peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5]);
+        esp_hf_client_connect(peer_addr);
+    }
+    vTaskDelete(NULL);
+}
+
+void bt_app_hf_reconnect_bonded(void)
+{
+    int bonded = esp_bt_gap_get_bond_device_num();
+    if (bonded <= 0) {
+        return;
+    }
+    esp_bd_addr_t list[bonded];
+    if (esp_bt_gap_get_bond_device_list(&bonded, list) != ESP_OK || bonded <= 0) {
+        return;
+    }
+    memcpy(peer_addr, list[0], ESP_BD_ADDR_LEN);
+    xTaskCreate(reconnect_task, "hf_reconnect", 3072, NULL, 5, NULL);
+}
+
 void app_main(void)
 {
     char bda_str[18] = {0};
@@ -253,6 +286,7 @@ static void bt_hf_client_hdl_stack_evt(uint16_t event, void *p_param)
 
         /* phone initiates pairing; use the `con` console command to connect from this side */
         ESP_LOGI(BT_HF_TAG, "discoverable as 'callbridge'; pair from the phone");
+
         break;
     }
     default:

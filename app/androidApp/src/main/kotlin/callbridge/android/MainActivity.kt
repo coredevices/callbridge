@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContentPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -24,6 +26,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,14 +34,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import callbridge.BleState
 import callbridge.Control
+import callbridge.ServerState
 import callbridge.Session
-import callbridge.SessionState
 import callbridge.scanCallbridge
-import com.juul.kable.Advertisement
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class MainActivity : ComponentActivity() {
     private var service by mutableStateOf<RelayService?>(null)
@@ -51,10 +56,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-            // Notification permission is optional; Bluetooth is required for the connectedDevice foreground service.
+            // Notification + mic are optional (mic only gates the SCO test); Bluetooth is required for the
+            // connectedDevice foreground service.
             if (granted[Manifest.permission.BLUETOOTH_SCAN] == true && granted[Manifest.permission.BLUETOOTH_CONNECT] == true) startRelay()
             else denied = true
-        }.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.POST_NOTIFICATIONS))
+        }.launch(arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.POST_NOTIFICATIONS, Manifest.permission.RECORD_AUDIO))
         setContent {
             MaterialTheme {
                 when {
@@ -76,48 +82,98 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun Screen(session: Session) {
-    val state by session.state.collectAsState()
+    val ble by session.ble.collectAsState()
+    val server by session.server.collectAsState()
     val stats by session.stats.collectAsState()
+    val latency by session.latency.collectAsState()
     val scope = rememberCoroutineScope()
-    var serverUrl by remember { mutableStateOf("ws://10.0.2.2:8080/ws") }
+    val context = LocalContext.current
+    val sco = remember { ScoTester(context) }
+    DisposableEffect(sco) { onDispose { sco.closeNow() } }
+    var scoOpen by remember { mutableStateOf(false) }
+    var scoBusy by remember { mutableStateOf(false) }
+    var scoStatus by remember { mutableStateOf("") }
+    var serverUrl by remember { mutableStateOf("ws://127.0.0.1:8080/ws") } // adb reverse tcp:8080 tcp:8765
     var room by remember { mutableStateOf("demo") }
     var echo by remember { mutableStateOf(true) }
     var loopback by remember { mutableStateOf(false) }
+    val bleBusy = ble is BleState.Connecting
+    val serverBusy = server is ServerState.Connecting
 
-    Column(Modifier.safeContentPadding().padding(16.dp)) {
+    Column(Modifier.safeContentPadding().padding(16.dp).verticalScroll(rememberScrollState())) {
         Text("callbridge", style = MaterialTheme.typography.headlineMedium)
-        Text("state: $state")
+        Text("ESP32 (BLE): $ble")
+        Text("server: $server")
         Text("call: ${stats.callState}")
         Spacer(Modifier.height(12.dp))
 
-        when (state) {
-            is SessionState.Idle, is SessionState.Error -> Button(onClick = {
+        if (ble is BleState.Connected) {
+            Button(onClick = { scope.launch { session.disconnectBle() } }) { Text("Disconnect ESP32") }
+        } else {
+            Button(enabled = !bleBusy, onClick = {
                 scope.launch {
-                    val adv: Advertisement = scanCallbridge().first()
-                    session.connect(adv)
+                    val adv = runCatching { withTimeout(10_000) { scanCallbridge().first() } }.getOrNull()
+                    if (adv == null) scoStatus = "no callbridge advertisement seen in 10 s" else session.connectBle(adv)
                 }
-            }) { Text("Scan + connect") }
-            else -> Button(onClick = { scope.launch { session.disconnect() } }) { Text("Disconnect") }
+            }) { Text("Scan + connect ESP32") }
         }
 
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(serverUrl, { serverUrl = it }, label = { Text("server ws url") }, modifier = Modifier.fillMaxWidth())
         Row { Text("echo mode"); Switch(echo, { echo = it }) }
         if (!echo) OutlinedTextField(room, { room = it }, label = { Text("room") })
-        Button(enabled = state is SessionState.Connected, onClick = {
-            scope.launch { session.startRelay(serverUrl, if (echo) "echo" else "room", room, 500) }
-        }) { Text("Start relay") }
+        if (server is ServerState.Connected) {
+            Button(onClick = { scope.launch { session.disconnectServer() } }) { Text("Stop relay") }
+        } else {
+            Button(enabled = !serverBusy, onClick = {
+                scope.launch { session.connectServer(serverUrl, if (echo) "echo" else "room", room, 500) }
+            }) { Text("Start relay") }
+        }
 
         Spacer(Modifier.height(12.dp))
         Row {
-            Button(onClick = { scope.launch { session.sendControl(Control.answer()) } }) { Text("Answer") }
-            Spacer(Modifier.height(0.dp).padding(4.dp))
-            Button(onClick = { scope.launch { session.sendControl(Control.hangup()) } }) { Text("Hang up") }
+            Button(enabled = ble is BleState.Connected, onClick = { scope.launch { session.sendControl(Control.answer()) } }) { Text("Answer") }
+            Spacer(Modifier.padding(4.dp))
+            Button(enabled = ble is BleState.Connected, onClick = { scope.launch { session.sendControl(Control.hangup()) } }) { Text("Hang up") }
         }
         Row {
             Text("ESP loopback")
-            Switch(loopback, { loopback = it; scope.launch { session.sendControl(Control.loopback(it)) } })
+            Switch(loopback, { loopback = it; scope.launch { session.sendControl(Control.loopback(it)) } }, enabled = ble is BleState.Connected)
         }
+
+        Spacer(Modifier.height(12.dp))
+        Text("SCO test (no call needed; ESP loopback must be on)", style = MaterialTheme.typography.titleSmall)
+        Row {
+            Text("SCO open")
+            Switch(scoOpen, enabled = !scoBusy, onCheckedChange = { on ->
+                scope.launch {
+                    scoBusy = true
+                    try {
+                        if (on) { sco.open(); scoOpen = true; scoStatus = "SCO up" }
+                        else { sco.close(); scoOpen = false; scoStatus = "" }
+                    } catch (e: Exception) { scoOpen = false; scoStatus = e.message ?: e.toString() }
+                    scoBusy = false
+                }
+            })
+        }
+        Button(enabled = scoOpen && !scoBusy, onClick = {
+            scope.launch {
+                scoBusy = true
+                scoStatus = "measuring…"
+                val ms = runCatching { sco.measure() }.getOrElse { scoStatus = it.message ?: it.toString(); null }
+                session.setScoRoundTrip(ms)
+                if (ms != null) scoStatus = "SCO round trip %.0f ms".format(ms)
+                else if (scoStatus == "measuring…") scoStatus = "burst never came back (loopback off / too quiet?)"
+                scoBusy = false
+            }
+        }) { Text("Measure SCO round trip") }
+        Text(scoStatus)
+
+        Spacer(Modifier.height(12.dp))
+        Text("Latency (round trip)", style = MaterialTheme.typography.titleSmall)
+        fun ms(v: Double?) = v?.let { "%.0f ms".format(it) } ?: "pending"
+        Text("SCO phone⇄ESP ${ms(latency.scoRtMs)} · BLE ESP⇄app ${ms(latency.bleRtMs)} · WS app⇄server ${ms(latency.wsRtMs)}")
+        Text("total ${ms(latency.totalRtMs)}, est. one-way ${ms(latency.totalRtMs?.div(2))}")
 
         Spacer(Modifier.height(12.dp))
         Text("up   ESP→server: ${stats.espToServer} frames, lost ${stats.lostFromEsp}")
@@ -125,6 +181,6 @@ fun Screen(session: Session) {
         Text("down server→ESP: ${stats.serverToEsp} frames, lost ${stats.lostFromServer}")
         LinearProgressIndicator(progress = { stats.levelDown / 32767f }, modifier = Modifier.fillMaxWidth())
         stats.esp?.let { Text("esp tx ${it.txFrames} rx ${it.rxFrames} lost ${it.rxLost} late ${it.rxLate} sco_drops ${it.scoDrops}") }
-        Button(onClick = { scope.launch { session.sendControl(Control.requestStats()) } }) { Text("Refresh ESP stats") }
+        Button(enabled = ble is BleState.Connected, onClick = { scope.launch { session.sendControl(Control.requestStats()) } }) { Text("Refresh ESP stats") }
     }
 }

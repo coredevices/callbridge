@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>callbridge latency</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb;
+    --surface-2: #f3f2ef;
+    --text: #0b0b0b;
+    --text-2: #52514e;
+    --text-3: #8a8985;
+    --grid: #e6e5e1;
+    --sco: #2a78d6;   /* categorical slot 1, blue   */
+    --ble: #eb6834;   /* slot 2, orange             */
+    --ws:  #1baf7a;   /* slot 3, aqua               */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19; --surface-2: #242423; --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985; --grid: #333331;
+      --sco: #3987e5; --ble: #d95926; --ws: #199e70;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --surface-2: #242423; --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985; --grid: #333331;
+    --sco: #3987e5; --ble: #d95926; --ws: #199e70;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; background: var(--surface); color: var(--text);
+         font: 14px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-2); margin: 0 0 20px; }
+  .filters { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  select, button { font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--grid); border-radius: 6px; padding: 6px 10px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .tile { background: var(--surface-2); border-radius: 8px; padding: 12px 14px; }
+  .tile .label { color: var(--text-2); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .tile .value { font-size: 28px; font-weight: 600; margin-top: 2px; }
+  .tile .value small { font-size: 14px; font-weight: 400; color: var(--text-2); margin-left: 3px; }
+  .tile .pending { color: var(--text-3); font-size: 16px; font-weight: 400; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .card { background: var(--surface-2); border-radius: 8px; padding: 14px; margin-bottom: 20px; }
+  .card h2 { font-size: 14px; font-weight: 600; margin: 0 0 10px; }
+  .chart { position: relative; }
+  svg { width: 100%; height: 280px; display: block; touch-action: none; overflow: visible; }
+  .grid line { stroke: var(--grid); stroke-width: 1; }
+  .axis text { fill: var(--text-3); font-size: 11px; }
+  .series path { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .series .end { font-size: 11px; fill: var(--text-2); }
+  .crosshair { stroke: var(--text-3); stroke-width: 1; display: none; }
+  .tip { position: absolute; pointer-events: none; display: none; background: var(--surface); border: 1px solid var(--grid);
+         border-radius: 6px; padding: 8px 10px; font-size: 12px; min-width: 130px; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+  .tip .t { color: var(--text-2); margin-bottom: 4px; }
+  .tip .row { display: flex; justify-content: space-between; gap: 12px; }
+  .tip .row b { font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 16px; margin-top: 8px; color: var(--text-2); font-size: 12px; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  details summary { cursor: pointer; color: var(--text-2); }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--text-2); font-weight: 500; font-size: 12px; }
+  .how { color: var(--text-2); font-size: 13px; }
+  .how dt { font-weight: 600; color: var(--text); margin-top: 8px; }
+  .how dd { margin: 2px 0 0; }
+  .empty { color: var(--text-3); padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>callbridge latency</h1>
+  <p class="sub">Round-trip time per hop, reported by the companion app every 2 s. Total is the sum of the hops.</p>
+
+  <div class="filters">
+    <label>Client <select id="client"></select></label>
+    <label>Window
+      <select id="window">
+        <option value="300000">5 min</option>
+        <option value="900000" selected>15 min</option>
+        <option value="1800000">30 min</option>
+      </select>
+    </label>
+    <span id="status" class="how"></span>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Total round trip</div><div class="value" id="v-total">–</div></div>
+    <div class="tile"><div class="label">Est. one-way</div><div class="value" id="v-oneway">–</div></div>
+    <div class="tile"><div class="label"><i class="swatch" style="background:var(--sco)"></i>SCO · phone ⇄ ESP32</div><div class="value" id="v-sco">–</div></div>
+    <div class="tile"><div class="label"><i class="swatch" style="background:var(--ble)"></i>BLE · ESP32 ⇄ app</div><div class="value" id="v-ble">–</div></div>
+    <div class="tile"><div class="label"><i class="swatch" style="background:var(--ws)"></i>WebSocket · app ⇄ server</div><div class="value" id="v-ws">–</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Round trip by hop over time</h2>
+    <div class="chart">
+      <svg id="chart" viewBox="0 0 900 280" preserveAspectRatio="none" role="img" aria-label="Round-trip latency per hop over time"></svg>
+      <div class="tip" id="tip"></div>
+    </div>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--sco)"></i>SCO</span>
+      <span><i class="swatch" style="background:var(--ble)"></i>BLE</span>
+      <span><i class="swatch" style="background:var(--ws)"></i>WebSocket</span>
+    </div>
+    <details>
+      <summary>Table view (last 20 samples)</summary>
+      <table><thead><tr><th>time</th><th>SCO ms</th><th>BLE ms</th><th>WS ms</th><th>total ms</th></tr></thead><tbody id="tbody"></tbody></table>
+    </details>
+  </div>
+
+  <div class="card how">
+    <h2>How each hop is measured</h2>
+    <dl>
+      <dt>SCO · phone ⇄ ESP32</dt><dd>App opens a Bluetooth SCO link to the ESP32 and plays a 1 kHz tone burst; the ESP32 loops its SCO input back; the app times the burst's return in its microphone stream. Includes Android audio-stack latency on both ends.</dd>
+      <dt>BLE · ESP32 ⇄ app</dt><dd>App writes a ping on the control characteristic; firmware answers with a pong notification. Pending until the GATT service ships.</dd>
+      <dt>WebSocket · app ⇄ server</dt><dd>App sends <code>{"type":"ping"}</code>; server echoes <code>pong</code>.</dd>
+      <dt>Est. one-way</dt><dd>Half the total round trip. Jitter buffers add on top of this in the real audio path.</dd>
+    </dl>
+  </div>
+</main>
+
+<script>
+(() => {
+  const SERIES = [
+    { key: 'sco_rt_ms', name: 'SCO', color: 'var(--sco)' },
+    { key: 'ble_rt_ms', name: 'BLE', color: 'var(--ble)' },
+    { key: 'ws_rt_ms',  name: 'WebSocket', color: 'var(--ws)' },
+  ];
+  const svg = document.getElementById('chart');
+  const tip = document.getElementById('tip');
+  const clientSel = document.getElementById('client');
+  const windowSel = document.getElementById('window');
+  const W = 900, H = 280, PAD = { l: 44, r: 100, t: 12, b: 28 };
+  let data = { clients: {} }, view = [];
+
+  const fmt = v => v == null ? null : (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
+  const total = s => SERIES.every(x => s[x.key] == null) ? null : SERIES.reduce((a, x) => a + (s[x.key] ?? 0), 0);
+  const timeStr = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  function setTile(id, v, pendingText) {
+    const el = document.getElementById(id);
+    el.textContent = '';
+    if (v == null) { const s = document.createElement('span'); s.className = 'pending'; s.textContent = pendingText; el.appendChild(s); return; }
+    el.appendChild(document.createTextNode(String(fmt(v))));
+    const small = document.createElement('small'); small.textContent = 'ms'; el.appendChild(small);
+  }
+
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  function render() {
+    const id = clientSel.value;
+    const c = data.clients[id];
+    const now = data.now || Date.now();
+    const win = Number(windowSel.value);
+    view = c ? (c.history || []).filter(s => now - s.t <= win) : [];
+    const last = view[view.length - 1];
+
+    document.getElementById('status').textContent = c ? (c.online ? `online · ${c.mode} mode` : 'offline') : '';
+    const partial = last && SERIES.some(x => last[x.key] == null);
+    setTile('v-total', last ? total(last) : null, 'no data');
+    setTile('v-oneway', last ? (total(last) == null ? null : total(last) / 2) : null, 'no data');
+    setTile('v-sco', last?.sco_rt_ms, 'pending');
+    setTile('v-ble', last?.ble_rt_ms, 'pending');
+    setTile('v-ws', last?.ws_rt_ms, 'pending');
+    if (partial) document.getElementById('v-total').title = 'sum of measured hops only';
+
+    // table
+    const tb = document.getElementById('tbody'); tb.textContent = '';
+    for (const s of view.slice(-20).reverse()) {
+      const tr = document.createElement('tr');
+      for (const v of [timeStr(s.t), fmt(s.sco_rt_ms), fmt(s.ble_rt_ms), fmt(s.ws_rt_ms), fmt(total(s))]) {
+        const td = document.createElement('td'); td.textContent = v == null ? '–' : v; tr.appendChild(td);
+      }
+      tb.appendChild(tr);
+    }
+
+    // chart
+    svg.textContent = '';
+    if (view.length < 2) { el('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle', fill: 'var(--text-3)', 'font-size': 13 }, svg).textContent = 'waiting for samples…'; return; }
+    const t0 = now - win, t1 = now;
+    const ymax = Math.min(1e6, Math.max(20, ...view.flatMap(s => SERIES.map(x => s[x.key] ?? 0)))) * 1.1;
+    const X = t => PAD.l + (t - t0) / (t1 - t0) * (W - PAD.l - PAD.r);
+    const Y = v => PAD.t + (1 - v / ymax) * (H - PAD.t - PAD.b);
+
+    const grid = el('g', { class: 'grid' }, svg), axis = el('g', { class: 'axis' }, svg);
+    const step = niceStep(ymax / 4);
+    for (let v = 0; v <= ymax; v += step) {
+      el('line', { x1: PAD.l, x2: W - PAD.r, y1: Y(v), y2: Y(v) }, grid);
+      el('text', { x: PAD.l - 6, y: Y(v) + 4, 'text-anchor': 'end' }, axis).textContent = v + (v === 0 ? '' : '');
+    }
+    el('text', { x: PAD.l - 6, y: PAD.t - 2, 'text-anchor': 'end' }, axis).textContent = 'ms';
+    for (let k = 0; k <= 3; k++) {
+      const t = t0 + (t1 - t0) * k / 3;
+      el('text', { x: X(t), y: H - 8, 'text-anchor': k === 0 ? 'start' : k === 3 ? 'end' : 'middle' }, axis).textContent = timeStr(t);
+    }
+
+    const sg = el('g', { class: 'series' }, svg);
+    for (const x of SERIES) {
+      let d = '', lastPt = null;
+      for (const s of view) {
+        const v = s[x.key];
+        if (v == null) { d += ' '; lastPt = null; continue; }
+        d += (lastPt ? 'L' : 'M') + X(s.t).toFixed(1) + ' ' + Y(v).toFixed(1);
+        lastPt = [X(s.t), Y(v), v];
+      }
+      if (!d.trim()) continue;
+      el('path', { d, stroke: x.color }, sg);
+      if (lastPt) el('text', { class: 'end', x: lastPt[0] + 6, y: lastPt[1] + 4 }, sg).textContent = `${x.name} ${fmt(lastPt[2])}`;
+    }
+    el('line', { class: 'crosshair', id: 'xh', y1: PAD.t, y2: H - PAD.b }, svg);
+  }
+
+  function niceStep(raw) { const p = Math.pow(10, Math.floor(Math.log10(raw))); const m = raw / p; return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p; }
+
+  // crosshair + tooltip: nearest sample in X, all series listed
+  svg.addEventListener('pointermove', e => {
+    if (view.length < 2) return;
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width * W;
+    const now = data.now || Date.now(), win = Number(windowSel.value);
+    const tAt = now - win + (px - PAD.l) / (W - PAD.l - PAD.r) * win;
+    let best = view[0];
+    for (const s of view) if (Math.abs(s.t - tAt) < Math.abs(best.t - tAt)) best = s;
+    const xh = document.getElementById('xh');
+    const xPx = PAD.l + (best.t - (now - win)) / win * (W - PAD.l - PAD.r);
+    xh.setAttribute('x1', xPx); xh.setAttribute('x2', xPx); xh.style.display = 'block';
+    tip.textContent = '';
+    const t = document.createElement('div'); t.className = 't'; t.textContent = timeStr(best.t); tip.appendChild(t);
+    for (const x of SERIES.concat([{ key: '__total', name: 'total' }])) {
+      const v = x.key === '__total' ? total(best) : best[x.key];
+      const row = document.createElement('div'); row.className = 'row';
+      const b = document.createElement('b'); b.textContent = v == null ? 'pending' : fmt(v) + ' ms';
+      const n = document.createElement('span'); n.textContent = x.name;
+      row.append(b, n); tip.appendChild(row);
+    }
+    tip.style.display = 'block';
+    const left = xPx / W * r.width;
+    tip.style.left = (left + 12 + 150 > r.width ? left - 162 : left + 12) + 'px';
+    tip.style.top = Math.max(0, (e.clientY - r.top) - 20) + 'px';
+  });
+  svg.addEventListener('pointerleave', () => { tip.style.display = 'none'; const xh = document.getElementById('xh'); if (xh) xh.style.display = 'none'; });
+
+  clientSel.addEventListener('change', render);
+  windowSel.addEventListener('change', render);
+
+  async function poll() {
+    try {
+      const r = await fetch('/stats', { cache: 'no-store' });
+      data = await r.json();
+      const ids = Object.keys(data.clients).sort();
+      const cur = clientSel.value;
+      const sig = ids.map(id => id + ':' + data.clients[id].online).join();
+      if (sig !== clientSel.dataset.sig) {
+        clientSel.dataset.sig = sig;
+        clientSel.textContent = '';
+        for (const id of ids) { const o = document.createElement('option'); o.value = id; o.textContent = (data.clients[id].name || id) + (data.clients[id].online ? '' : ' (offline)'); clientSel.appendChild(o); }
+        if (ids.includes(cur)) clientSel.value = cur;
+      }
+      render();
+    } catch (e) { document.getElementById('status').textContent = 'server unreachable'; }
+  }
+  poll(); setInterval(poll, 1000);
+})();
+</script>
+</body>
+</html>

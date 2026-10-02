@@ -51,6 +51,7 @@ First byte is the type. ESP → app (notify/read):
 | 0x01 | call state: u8 (0 idle, 1 incoming, 2 dialing, 3 active, 4 sco_up) |
 | 0x02 | codec: u8 (same values as frame `codec`)               |
 | 0x03 | stats: u32 tx_frames, u32 rx_frames, u32 rx_lost, u32 rx_late, u32 sco_drops |
+| 0x04 | pong: u32 token (echo of 0x15)                         |
 
 app → ESP (write):
 
@@ -61,6 +62,7 @@ app → ESP (write):
 | 0x12 | loopback: u8 (0 off, 1 on)    |
 | 0x13 | dial: ASCII number            |
 | 0x14 | request stats (ESP replies 0x03) |
+| 0x15 | ping: u32 token (ESP replies 0x04 immediately) |
 
 ## WebSocket (app ⇄ server)
 
@@ -70,15 +72,24 @@ are JSON control.
 Client sends first:
 
 ```json
-{"type":"hello","mode":"echo","room":"demo","delayMs":500}
+{"type":"hello","mode":"echo","room":"demo","delayMs":500,"name":"Pixel 9 Pro"}
 ```
+
+`name` is optional and only labels the client on the latency page.
 
 - `mode`: `echo` (server returns the client's own frames after `delayMs`) or
   `room` (frames go to every other client in `room`).
 - Server replies `{"type":"ok"}` or `{"type":"error","message":"..."}`.
 
 Server → client control: `{"type":"peer","count":n}` when room membership
-changes. Frames returned by the server keep the sender's `seq`; the app does
+changes.
+
+After hello, the client may send:
+
+- `{"type":"ping","t":<any number>}` → server replies `{"type":"pong","t":<same>}`.
+- `{"type":"latency","sco_rt_ms":n|null,"ble_rt_ms":n|null,"ws_rt_ms":n|null}`
+  every ~2 s. The server keeps the last 30 min per client and serves them at
+  `GET /stats` (JSON) and on the page at `GET /` (per-hop tiles + time series). Frames returned by the server keep the sender's `seq`; the app does
 not renumber.
 
 ## Timing / buffering
@@ -87,3 +98,16 @@ not renumber.
   underrun play silence, on overrun drop oldest. Counted in `rx_lost`/`rx_late`.
 - App: no buffering, pure relay. Stats are derived from `seq` gaps.
 - Expected round trip (phone→ESP→app→server→app→ESP→phone): 150–300 ms.
+
+## Latency
+
+Each hop is measured as a round trip; the page shows them side by side and
+their sum. Jitter buffers add on top of these in the real audio path.
+
+| hop | how | measured by |
+|-----|-----|-------------|
+| SCO phone ⇄ ESP32 | app opens SCO (no call needed), plays a 1 kHz 60 ms burst, firmware loops SCO input back, app detects the burst's return (Goertzel at 1 kHz, 10 ms resolution). Includes Android audio-stack latency. | app, on demand |
+| BLE ESP32 ⇄ app | control ping 0x15 / pong 0x04 | app, every 2 s |
+| WebSocket app ⇄ server | JSON ping / pong | app, every 2 s |
+
+Full-path one-way estimate = total round trip / 2.
