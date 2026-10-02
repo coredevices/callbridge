@@ -8,7 +8,7 @@
 set -u
 KA="${1:-20}"; BATCH="${2:-3}"; N="${3:-12}"; IV="${4:-2.5s}"; ECHO="${5:-sco}"
 HERE="$(cd "$(dirname "$0")" && pwd)"; C="$HERE/cmd.sh"
-export CALLBRIDGE_SERIAL="${CALLBRIDGE_SERIAL:-45211FDAP00047}"
+export CALLBRIDGE_SERIAL="${CALLBRIDGE_SERIAL:-$(adb devices | awk 'NR==2{print $1}')}"
 adb -s "$CALLBRIDGE_SERIAL" reverse tcp:8080 tcp:8765 >/dev/null
 # the relay service lives in the app: wake the phone, keep it awake on USB, bring the app up
 adb -s "$CALLBRIDGE_SERIAL" shell svc power stayon usb

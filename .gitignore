@@ -19,3 +19,7 @@ app/iosApp/build/
 # server
 server/bin/
 firmware/sdkconfig
+
+# editor / build outputs
+firmware/.cache/
+server/server
