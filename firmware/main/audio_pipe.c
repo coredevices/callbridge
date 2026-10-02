@@ -194,8 +194,19 @@ static void out_prefill_if_empty(void)
     xSemaphoreGive(s_out_lock);
 }
 
+/* Outgoing SCO is paced 1:1 by incoming SCO. Bluedroid's bta_hf_client_sco_event() pulls outgoing
+ * packets in a while(true) loop until this callback returns short. Always returning a full buffer
+ * (silence-padded) made it encode silence until the SCO queue filled: core 0 spun in the mSBC encoder
+ * (task watchdog) and up to a second of audio queued ahead of real data. Only BTU calls both
+ * callbacks, so a plain counter is enough. */
+static int32_t s_out_credit = 0;
+
 uint32_t audio_pipe_sco_out(uint8_t *pcm, uint32_t bytes)
 {
+    if (s_out_credit < (int32_t)bytes) {
+        return 0;
+    }
+    s_out_credit -= bytes;
     uint32_t got = 0;
     s_st.sco_out_bytes += bytes;
     if (xSemaphoreTake(s_out_lock, pdMS_TO_TICKS(5)) != pdTRUE) {
@@ -226,6 +237,8 @@ uint32_t audio_pipe_sco_out(uint8_t *pcm, uint32_t bytes)
 void audio_pipe_sco_in(const uint8_t *pcm, uint32_t bytes)
 {
     s_st.sco_in_bytes += bytes;
+    s_out_credit += bytes;
+    if (s_out_credit > (int32_t)(4 * bytes)) s_out_credit = 4 * bytes;   /* never let a backlog of credit build */
     if (s_loopback) {
         out_write(pcm, bytes, LOOPBACK_MAX_MS);
     }

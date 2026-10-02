@@ -215,10 +215,7 @@ void bt_app_hf_client_cb(esp_hf_client_cb_event_t event, esp_hf_client_cb_param_
             }
             if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_CONNECTED) {
                 link_policy_apply(param->conn_stat.remote_bda);   /* the ACL is up now; keep it out of sniff */
-                /* we are the slave: ask the master to poll us every 10 slots (6.25 ms) so uplink
-                 * frames get transmit opportunities regardless of what else the phone is doing */
-                esp_err_t q = esp_bt_gap_set_qos(param->conn_stat.remote_bda, 10);
-                ESP_LOGI(BT_HF_TAG, "qos t_poll=10 request: %s", esp_err_to_name(q));
+                /* no QoS/t_poll request: audio rides BLE, and fast ACL polling next to eSCO starved it */
             }
             if (param->conn_stat.state == ESP_HF_CLIENT_CONNECTION_STATE_SLC_CONNECTED) {
                 /* AT+NREC=0: ask the phone not to run its echo canceller / noise reduction on our audio */

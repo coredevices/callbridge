@@ -33,7 +33,6 @@
       <option value="app">phone app (no dongle): run scripts/cmd.sh appecho</option>
       <option value="full" selected>dongle + phone (full path): scripts/cmd.sh scoecho</option>
     </select></label>
-    <label>Codec <select id="codec"><option value="opus" selected>Opus 16 kbps (link format)</option><option value="adpcm">ADPCM 8 kHz (old)</option></select></label>
     <label>Room <input id="room" value="demo" size="10"></label>
     <label>Jitter target <select id="jitter"><option value="40">40 ms</option><option value="60" selected>60 ms</option><option value="100">100 ms</option></select></label>
     <label>Mic gain <select id="gain"><option value="1">1x</option><option value="2">2x</option><option value="4" selected>4x</option><option value="8">8x</option></select></label>
@@ -59,45 +58,7 @@
 
 <script>
 (() => {
-  const RATE = 8000, FRAME = 160, HDR = 6, CODEC_8K = 1;
-  const INDEX_ADJ = [-1, -1, -1, -1, 2, 4, 6, 8];
-  const STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767];
-  const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
-
-  // self-contained frames: encoder state resets every frame (predictor 0, index 0), like the firmware
-  function encodeFrame(pcm, seq) {
-    const out = new Uint8Array(HDR + FRAME / 2);
-    out[0] = seq & 0xff; out[1] = (seq >> 8) & 0xff; out[2] = CODEC_8K; out[3] = 0; out[4] = 0; out[5] = 0;
-    let pred = 0, idx = 0;
-    for (let i = 0; i < FRAME; i++) {
-      const step = STEP[idx];
-      let diff = pcm[i] - pred, nib = 0;
-      if (diff < 0) { nib = 8; diff = -diff; }
-      let delta = step >> 3;
-      if (diff >= step) { nib |= 4; diff -= step; delta += step; }
-      if (diff >= (step >> 1)) { nib |= 2; diff -= step >> 1; delta += step >> 1; }
-      if (diff >= (step >> 2)) { nib |= 1; delta += step >> 2; }
-      pred = clamp(nib & 8 ? pred - delta : pred + delta, -32768, 32767);
-      idx = clamp(idx + INDEX_ADJ[nib & 7], 0, 88);
-      if (i & 1) out[HDR + (i >> 1)] |= nib << 4; else out[HDR + (i >> 1)] = nib;
-    }
-    return out;
-  }
-  function decodeFrame(b) {
-    if (b.length < HDR || b[2] !== CODEC_8K) return null;
-    let pred = (b[3] | (b[4] << 8)) << 16 >> 16, idx = clamp(b[5], 0, 88);
-    const n = (b.length - HDR) * 2, pcm = new Int16Array(n);
-    for (let i = 0; i < n; i++) {
-      const nib = i & 1 ? b[HDR + (i >> 1)] >> 4 : b[HDR + (i >> 1)] & 0x0f;
-      const step = STEP[idx];
-      let delta = step >> 3;
-      if (nib & 4) delta += step; if (nib & 2) delta += step >> 1; if (nib & 1) delta += step >> 2;
-      pred = clamp(nib & 8 ? pred - delta : pred + delta, -32768, 32767);
-      idx = clamp(idx + INDEX_ADJ[nib & 7], 0, 88);
-      pcm[i] = pred;
-    }
-    return pcm;
-  }
+  const HDR = 6;
 
   let ws, ctx, mic, proc, seq = 0, stats = { tx: 0, rx: 0, lost: 0, under: 0, lastSeq: -1, rxSec: 0, rxRate: 0 };
   // level history: one sample per 20 ms frame, 10 s window; written by capture (up) and receive (down)
@@ -147,11 +108,10 @@
 
   async function join() {
     const room = $('room').value || 'demo';
-    const codec = $('codec').value;
     ctx = new AudioContext();
     const R = ctx.sampleRate, FR = R / 50;   // samples per 20 ms at the context rate
 
-    if (codec === 'opus') {
+    {
       if (!('AudioEncoder' in window)) throw new Error('this browser has no WebCodecs; use Chrome');
       encoder = new AudioEncoder({
         output: chunk => {
@@ -199,11 +159,6 @@
       if (f[2] === CODEC_OPUS && decoder) {
         decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: decTs, data: f.subarray(HDR) }));
         decTs += 20000;
-      } else if (f[2] === CODEC_8K) {
-        const pcm = decodeFrame(f);
-        if (!pcm) return;
-        const fl = new Float32Array(pcm.length); for (let i = 0; i < pcm.length; i++) fl[i] = pcm[i] / 32768;
-        enqueue(resample(fl, RATE, R));
       }
     };
     ws.onclose = () => { $('status').textContent = 'disconnected'; };
@@ -222,15 +177,9 @@
         const v = Math.max(-1, Math.min(1, inp[i] * gain));
         acc[accN++] = v; peak = Math.max(peak, Math.abs(v));
         if (accN === FR) {
-          if (codec === 'opus') {
-            if (encoder && encoder.state === 'configured') {
-              const ad = new AudioData({ format: 'f32-planar', sampleRate: R, numberOfFrames: FR, numberOfChannels: 1, timestamp: encTs, data: acc.slice() });
-              encoder.encode(ad); ad.close(); encTs += 20000;
-            }
-          } else if (ws && ws.readyState === 1) {
-            const lo = resample(acc, R, RATE), pcm = new Int16Array(FRAME);
-            for (let k = 0; k < FRAME; k++) pcm[k] = Math.round((lo[k] || 0) * 32767);
-            ws.send(encodeFrame(pcm, seq)); seq = (seq + 1) & 0xffff; stats.tx++;
+          if (encoder && encoder.state === 'configured') {
+            const ad = new AudioData({ format: 'f32-planar', sampleRate: R, numberOfFrames: FR, numberOfChannels: 1, timestamp: encTs, data: acc.slice() });
+            encoder.encode(ad); ad.close(); encTs += 20000;
           }
           let fp = 0; for (let k = 0; k < FR; k++) fp = Math.max(fp, Math.abs(acc[k]));
           upHist[histPos] = fp; downHist[histPos] = lastDownPeak; lastDownPeak = 0; histPos = (histPos + 1) % HIST;
@@ -254,7 +203,7 @@
     $('join').disabled = true; $('leave').disabled = false;
     $('status').textContent = `joining "${room}"…`;
     setInterval(() => { stats.rxRate = stats.rxSec * 2; stats.rxSec = 0; }, 500);
-    setInterval(() => { $('stats').textContent = `${codec} · sent ${stats.tx} · received ${stats.rx} (${stats.rxRate}/s, 50 = full) · lost ${stats.lost} · buffer ${Math.round(qSamples / R * 1000)} ms · underruns ${stats.under}`; }, 500);
+    setInterval(() => { $('stats').textContent = `opus · sent ${stats.tx} · received ${stats.rx} (${stats.rxRate}/s, 50 = full) · lost ${stats.lost} · buffer ${Math.round(qSamples / R * 1000)} ms · underruns ${stats.under}`; }, 500);
   }
   function leave() {
     ws && ws.close(); proc && proc.disconnect(); mic && mic.disconnect();
