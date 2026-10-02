@@ -26,21 +26,24 @@ fun scanCallbridge(): Flow<Advertisement> = Scanner {
 /** Platform MTU request; Android only, iOS negotiates on its own. */
 expect suspend fun Peripheral.requestMtuOrNull(mtu: Int): Int?
 
-class BleTransport(advertisement: Advertisement) {
+class BleTransport(advertisement: Advertisement) : Link {
+    override val kind = "ble"
     private val peripheral = Peripheral(advertisement)
     val state: StateFlow<State> get() = peripheral.state
 
-    suspend fun connect() {
+    /** Connects and negotiates MTU; returns the MTU (null where the platform does not report it). */
+    suspend fun connect(): Int? {
         peripheral.connect()
-        peripheral.requestMtuOrNull(CallbridgeGatt.MTU)
+        return peripheral.requestMtuOrNull(CallbridgeGatt.MTU)
     }
 
     suspend fun disconnect() = peripheral.disconnect()
+    override suspend fun close() = disconnect()
 
     /** Raw audio frames from the ESP32. */
-    fun audioIn(): Flow<ByteArray> = peripheral.observe(CallbridgeGatt.AUDIO_TX)
-    fun controlIn(): Flow<ByteArray> = peripheral.observe(CallbridgeGatt.CONTROL)
+    override fun audioIn(): Flow<ByteArray> = peripheral.observe(CallbridgeGatt.AUDIO_TX)
+    override fun controlIn(): Flow<ByteArray> = peripheral.observe(CallbridgeGatt.CONTROL)
 
-    suspend fun sendAudio(frame: ByteArray) = peripheral.write(CallbridgeGatt.AUDIO_RX, frame, WriteType.WithoutResponse)
-    suspend fun sendControl(msg: ByteArray) = peripheral.write(CallbridgeGatt.CONTROL, msg, WriteType.WithResponse)
+    override suspend fun sendAudio(frame: ByteArray) = peripheral.write(CallbridgeGatt.AUDIO_RX, frame, WriteType.WithoutResponse)
+    override suspend fun sendControl(msg: ByteArray) = peripheral.write(CallbridgeGatt.CONTROL, msg, WriteType.WithResponse)
 }

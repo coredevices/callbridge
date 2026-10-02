@@ -12,6 +12,7 @@ object Control {
     const val DIAL = 0x13
     const val REQUEST_STATS = 0x14
     const val PING = 0x15
+    const val BLAST = 0x16
 
     val callStateNames = listOf("idle", "incoming", "dialing", "active", "sco_up")
 
@@ -20,6 +21,8 @@ object Control {
     fun loopback(on: Boolean) = byteArrayOf(LOOPBACK.toByte(), if (on) 1 else 0)
     fun dial(number: String) = byteArrayOf(DIAL.toByte()) + number.encodeToByteArray()
     fun requestStats() = byteArrayOf(REQUEST_STATS.toByte())
+    /** Throughput test: firmware streams max-rate dummy frames (codec 0xFF) while on. */
+    fun blast(on: Boolean) = byteArrayOf(BLAST.toByte(), if (on) 1 else 0)
     /** Ping carries a u32 LE token; the pong echoes it. */
     fun ping(token: Int) = byteArrayOf(PING.toByte(), token.toByte(), (token shr 8).toByte(), (token shr 16).toByte(), (token shr 24).toByte())
     fun pongToken(msg: ByteArray): Int? = if (msg.size >= 5 && msg[0].toInt() == PONG)

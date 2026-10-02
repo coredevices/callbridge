@@ -138,3 +138,41 @@ func TestStatsStoreBounds(t *testing.T) {
 		t.Fatal("negative latency accepted")
 	}
 }
+
+func TestToneDetector(t *testing.T) {
+	rate := 16000
+	// a second of near-silence (low noise), then the burst
+	quiet := make([]int16, rate)
+	for i := range quiet {
+		quiet[i] = int16((i*7919)%64 - 32)
+	}
+	frames := encodeFrames(quiet, rate, 0)
+	burst := encodeFrames(append(tone(rate), make([]int16, rate*20/1000)...), rate, uint16(len(frames)))
+	d := &detector{}
+	for _, f := range frames {
+		if d.feed(f) {
+			t.Fatal("false positive on silence")
+		}
+	}
+	d.armed = true
+	if !d.feed(burst[0]) {
+		t.Fatal("burst not detected on its first frame")
+	}
+	if d.feed(burst[1]) {
+		t.Fatal("should disarm after detection")
+	}
+	// round trip sanity of the codec itself
+	pcm, r := decodeFrame(burst[0])
+	if r != rate || len(pcm) != rate*20/1000 {
+		t.Fatalf("decode: rate %d len %d", r, len(pcm))
+	}
+}
+
+func TestDecodeFrameRejectsBadLength(t *testing.T) {
+	if pcm, _ := decodeFrame([]byte{0, 0, codecAdpcm16, 0, 0, 0}); pcm != nil {
+		t.Fatal("header-only frame accepted")
+	}
+	if pcm, _ := decodeFrame(append([]byte{0, 0, codecAdpcm8k, 0, 0, 0}, make([]byte, 80)...)); pcm == nil {
+		t.Fatal("valid 8 kHz frame rejected")
+	}
+}

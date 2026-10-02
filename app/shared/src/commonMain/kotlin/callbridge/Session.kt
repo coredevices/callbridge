@@ -4,13 +4,20 @@ import com.juul.kable.Advertisement
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlin.concurrent.atomics.AtomicInt
+import kotlin.concurrent.atomics.AtomicLong
+import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.math.abs
 import kotlin.time.TimeSource
 
@@ -19,19 +26,30 @@ data class Stats(
     val espToServer: Long = 0, val serverToEsp: Long = 0,
     val lostFromEsp: Long = 0, val lostFromServer: Long = 0,
     val levelUp: Int = 0, val levelDown: Int = 0,   // peak |sample| of last frame, 0..32767
+    val downDropped: Long = 0,                       // server frames dropped because BLE could not keep up
     val esp: EspStats? = null, val callState: String = "idle",
+    val bleKbps: Double = 0.0, val bleFramesPerSec: Int = 0,   // measured on audio_tx over the last second
 )
 
-/** Per-hop round-trip times in ms; null = not measured yet. See docs/protocol.md "Latency". */
-data class Latency(val scoRtMs: Double? = null, val bleRtMs: Double? = null, val wsRtMs: Double? = null) {
+/**
+ * Per-hop round-trip times in ms from pings, plus end-to-end values measured with a real tone burst
+ * (phone → server one-way, server → phone one-way, full loop). null = not measured yet.
+ */
+data class Latency(
+    val scoRtMs: Double? = null, val bleRtMs: Double? = null, val wsRtMs: Double? = null,
+    val upMs: Double? = null, val downMs: Double? = null, val fullRtMs: Double? = null,
+) {
     val totalRtMs: Double? get() = if (scoRtMs == null && bleRtMs == null && wsRtMs == null) null
         else (scoRtMs ?: 0.0) + (bleRtMs ?: 0.0) + (wsRtMs ?: 0.0)
 }
 
+/** Result of one end-to-end tone test. */
+data class E2EResult(val upMs: Double?, val downMs: Double?, val fullRtMs: Double?, val message: String)
+
 sealed interface BleState {
     data object Idle : BleState
     data class Connecting(val name: String) : BleState
-    data class Connected(val name: String) : BleState
+    data class Connected(val name: String, val link: String = "ble") : BleState
     data class Error(val message: String) : BleState
 }
 
@@ -46,6 +64,7 @@ sealed interface ServerState {
  * One ESP32 BLE link and one server link, independently connectable. Audio relays only while both
  * are up; latency reporting needs only the server.
  */
+@OptIn(ExperimentalAtomicApi::class)
 class Session(private val scope: CoroutineScope) {
     private val _ble = MutableStateFlow<BleState>(BleState.Idle)
     val ble: StateFlow<BleState> = _ble
@@ -56,11 +75,19 @@ class Session(private val scope: CoroutineScope) {
     private val _latency = MutableStateFlow(Latency())
     val latency: StateFlow<Latency> = _latency
 
+    /** What the user wants loopback to be outside of tests (the firmware boots with it on). */
+    @Volatile var loopbackWanted: Boolean = true
+
     /** Platform SCO test (Android) stores its result here. */
     fun setScoRoundTrip(ms: Double?) = _latency.update { it.copy(scoRtMs = ms) }
 
     private val lock = Mutex() // serializes connect/disconnect on both sides
-    private var bleTransport: BleTransport? = null
+    private var bleTransport: Link? = null   // the data link in use: SPP (Android) or BLE GATT
+    /** Latest-wins queue towards the ESP32: BLE writes are slow and serialized with control writes, so
+     *  stale audio is dropped here rather than queued behind everything else. */
+    private val downlink = Channel<ByteArray>(capacity = 6, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    /** Frames per link write towards the ESP32 (SPP packet budget is shared with the uplink). */
+    var downlinkBatch = 3
     private var serverClient: ServerClient? = null
     private val bleJobs = mutableListOf<Job>()
     private val serverJobs = mutableListOf<Job>()
@@ -70,22 +97,43 @@ class Session(private val scope: CoroutineScope) {
     private val clock = TimeSource.Monotonic.markNow()
     private class PendingPing(val token: Int, val sentMs: Double)
     private var pendingPing: PendingPing? = null // one immutable record: token + send time read together
+    /** BLE MTU negotiated on connect (Android only), for diagnostics. */
+    private val _mtu = MutableStateFlow<Int?>(null)
+    val mtu: StateFlow<Int?> = _mtu
 
+    /** Connects via a BLE advertisement: SPP to the same address when the platform has it, else GATT. */
     suspend fun connectBle(adv: Advertisement) = lock.withLock {
         if (bleTransport != null) return@withLock
         val name = adv.name ?: adv.identifier.toString()
         _ble.value = BleState.Connecting(name)
-        val t = BleTransport(adv)
-        try {
-            t.connect()
-        } catch (e: CancellationException) {
-            runCatching { t.disconnect() }; _ble.value = BleState.Idle; throw e
-        } catch (e: Exception) {
-            runCatching { t.disconnect() }; _ble.value = BleState.Error(e.message ?: "connect failed"); return@withLock
+        // BLE is the discovery mechanism; on Android the data goes over Classic SPP when the firmware
+        // offers it, and the BLE link is dropped so it does not take radio time from SCO.
+        val t: Link = openSppLink(adv.identifier.toString()) ?: run {
+            val b = BleTransport(adv)
+            try {
+                _mtu.value = b.connect()
+            } catch (e: CancellationException) {
+                runCatching { b.disconnect() }; _ble.value = BleState.Idle; throw e
+            } catch (e: Exception) {
+                runCatching { b.disconnect() }; _ble.value = BleState.Error(e.message ?: "connect failed"); return@withLock
+            }
+            b
         }
+        attach(t, name)
+    }
+
+    /** Connects straight over SPP to a bonded device (no BLE scan needed); Android only. */
+    suspend fun connectSpp(address: String, name: String) = lock.withLock {
+        if (bleTransport != null) return@withLock
+        _ble.value = BleState.Connecting(name)
+        val t = openSppLink(address) ?: run { _ble.value = BleState.Error("SPP connect to $name failed"); return@withLock }
+        attach(t, name)
+    }
+
+    private fun attach(t: Link, name: String) {
         bleTransport = t
         lastSeqFromEsp = -1
-        _ble.value = BleState.Connected(name)
+        _ble.value = BleState.Connected(name, t.kind)
         bleJobs += guardedBle(t) {
             t.controlIn().collect { msg ->
                 when (msg.firstOrNull()?.toInt()) {
@@ -98,11 +146,35 @@ class Session(private val scope: CoroutineScope) {
                 }
             }
         }
+        val bytesThisSec = AtomicLong(0L)
+        val framesThisSec = AtomicInt(0)
         bleJobs += guardedBle(t) {
             t.audioIn().collect { raw ->
+                bytesThisSec.addAndFetch(raw.size.toLong()); framesThisSec.addAndFetch(1)
                 val f = Frame.decode(raw) ?: return@collect
+                if (f.codec == Frame.CODEC_BLAST) return@collect   // throughput test frames: counted, not relayed
                 lastSeqFromEsp = account(lastSeqFromEsp, f.seq) { lost -> _stats.update { it.copy(espToServer = it.espToServer + 1, lostFromEsp = it.lostFromEsp + lost, levelUp = peak(f)) } }
                 serverClient?.sendAudio(raw)
+            }
+        }
+        bleJobs += guardedBle(t) {
+            while (true) {
+                delay(1_000)
+                val b = bytesThisSec.exchange(0L); val n = framesThisSec.exchange(0)
+                _stats.update { it.copy(bleKbps = b * 8 / 1000.0, bleFramesPerSec = n) }
+            }
+        }
+        bleJobs += guardedBle(t) {
+            // gather whatever is queued (up to downlinkBatch) and ship it in one write
+            for (first in downlink) {
+                val batch = mutableListOf(first)
+                while (batch.size < downlinkBatch) batch += downlink.tryReceive().getOrNull() ?: break
+                if (batch.size < downlinkBatch) {
+                    // wait briefly for the rest of a batch rather than sending a lone frame
+                    delay(20L * (downlinkBatch - batch.size))
+                    while (batch.size < downlinkBatch) batch += downlink.tryReceive().getOrNull() ?: break
+                }
+                t.sendAudioBatch(batch)
             }
         }
         bleJobs += guardedBle(t) {
@@ -112,7 +184,10 @@ class Session(private val scope: CoroutineScope) {
                 delay(2_000)
                 token++
                 pendingPing = PendingPing(token, nowMs())
-                try { t.sendControl(Control.ping(token)) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                try {
+                    t.sendControl(Control.ping(token))
+                    t.sendControl(Control.requestStats())
+                } catch (e: CancellationException) { throw e } catch (_: Exception) {}
             }
         }
     }
@@ -136,7 +211,7 @@ class Session(private val scope: CoroutineScope) {
             s.audioIn().collect { raw ->
                 val f = Frame.decode(raw) ?: return@collect
                 lastSeqFromServer = account(lastSeqFromServer, f.seq) { lost -> _stats.update { it.copy(serverToEsp = it.serverToEsp + 1, lostFromServer = it.lostFromServer + lost, levelDown = peak(f)) } }
-                bleTransport?.sendAudio(raw)
+                if (bleTransport != null) downlink.trySend(raw)
             }
             error("server closed the connection")
         }
@@ -153,15 +228,61 @@ class Session(private val scope: CoroutineScope) {
         }
     }
 
-    suspend fun sendControl(msg: ByteArray) { bleTransport?.sendControl(msg) }
+    /** Writes a control message; false if not connected or the write failed (the link may have just dropped). */
+    suspend fun sendControl(msg: ByteArray): Boolean {
+        val t = bleTransport ?: return false
+        return try { t.sendControl(msg); true } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+    }
+
+    /**
+     * End-to-end test with real audio. [fire] must: drain the phone's recorder, call `onFired` the
+     * instant the tone burst is written to the SCO link, then listen and return the ms until the
+     * burst comes back through the phone's microphone stream (or null). Needs BLE + server + SCO up.
+     * The firmware loopback is switched off for the test so the only way back is through the server.
+     */
+    suspend fun runE2E(fire: suspend (onFired: suspend () -> Unit) -> Double?): E2EResult {
+        println("callbridge e2e: start")
+        val s = serverClient ?: return E2EResult(null, null, null, "server not connected")
+        val t = bleTransport ?: return E2EResult(null, null, null, "ESP32 not connected")
+        if (s.serverNowMs() == null) return E2EResult(null, null, null, "no clock sync yet (wait for a pong)")
+        s.clearBurst()
+        var fired = false
+        val full = try {
+            t.sendControl(Control.loopback(false))
+            println("callbridge e2e: loopback off")
+            delay(300)
+            fire { fired = true; println("callbridge e2e: burst fired"); s.sendBurst(s.serverNowMs()!!) }.also { println("callbridge e2e: full=$it") }
+        } finally {
+            // restore even if the test was cancelled; the loopback switch in the UI reflects "on"
+            withContext(NonCancellable) { runCatching { t.sendControl(Control.loopback(loopbackWanted)) } }
+        }
+        if (!fired) return E2EResult(null, null, null, "no tone was fired (is SCO open?)")
+        // the server's detection may land a moment after the phone's
+        var up: Double? = null
+        repeat(20) { if (up == null) { up = s.burstDetected.value?.second; if (up == null) delay(100) } }
+        println("callbridge e2e: up=$up")
+        val down = if (full != null && up != null) full - up else null
+        _latency.update { it.copy(upMs = up, downMs = down, fullRtMs = full) }
+        s.sendE2E(full, down)
+        val msg = when {
+            up == null && full == null -> "burst not seen at the server or back at the phone"
+            up == null -> "phone heard it back but the server never detected it (check uplink audio)"
+            full == null -> "server detected it; nothing came back to the phone (check downlink)"
+            else -> "ok"
+        }
+        return E2EResult(up, down, full, msg)
+    }
 
     suspend fun disconnectBle() = lock.withLock { teardownBle(BleState.Idle) }
     suspend fun disconnectServer() = lock.withLock { teardownServer(ServerState.Idle) }
 
     private suspend fun teardownBle(final: BleState) {
         val jobs = bleJobs.toList(); bleJobs.clear()
-        jobs.forEach { it.cancel() }; jobs.forEach { it.join() }
-        bleTransport?.let { runCatching { it.disconnect() } }; bleTransport = null
+        jobs.forEach { it.cancel() }
+        // close the transport first: a writer blocked in a socket write only wakes when the socket closes
+        bleTransport?.let { runCatching { it.close() } }; bleTransport = null
+        jobs.forEach { it.join() }
+        while (downlink.tryReceive().isSuccess) { /* drop audio queued for the old link */ }
         pendingPing = null
         _stats.update { Stats() }
         _latency.update { it.copy(bleRtMs = null) }
@@ -181,7 +302,7 @@ class Session(private val scope: CoroutineScope) {
      * the process. Only the owning transport is torn down, so a late failure from an old link
      * cannot kill a newer one.
      */
-    private fun guardedBle(owner: BleTransport, block: suspend CoroutineScope.() -> Unit): Job = scope.launch {
+    private fun guardedBle(owner: Link, block: suspend CoroutineScope.() -> Unit): Job = scope.launch {
         try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) {
             scope.launch { lock.withLock { if (bleTransport === owner) teardownBle(BleState.Error(e.message ?: e.toString())) } }
         }

@@ -36,6 +36,16 @@ class ServerClient(
     /** Last measured app ⇄ server round trip, from ping/pong. */
     val rttMs: StateFlow<Double?> = _rttMs
 
+    /** server clock - local monotonic clock, in ms, from the last pong (server_t vs midpoint of the ping). */
+    @Volatile var clockOffsetMs: Double? = null
+        private set
+    /** Server clock estimate of "now" in ms, or null before the first pong. */
+    fun serverNowMs(): Double? = clockOffsetMs?.let { nowMs() + it }
+
+    private val _burstDetected = MutableStateFlow<Pair<Double, Double>?>(null) // (t_server, up_ms), latest
+    /** Set when the server's tone detector sees the burst we armed: (server detect time, one-way up ms). */
+    val burstDetected: StateFlow<Pair<Double, Double>?> = _burstDetected
+
     /** Connects and completes the hello handshake. Throws on error reply or 5 s timeout. */
     suspend fun connect() {
         var s: DefaultClientWebSocketSession? = null
@@ -72,9 +82,18 @@ class ServerClient(
         // malformed control messages must not end audio reception
         runCatching {
             val o = Json.parseToJsonElement(txt).jsonObject
-            if (o["type"]?.jsonPrimitive?.content == "pong") {
-                val t = o["t"]?.jsonPrimitive?.doubleOrNull ?: return
-                _rttMs.value = nowMs() - t
+            when (o["type"]?.jsonPrimitive?.content) {
+                "pong" -> {
+                    val t = o["t"]?.jsonPrimitive?.doubleOrNull ?: return
+                    val now = nowMs()
+                    _rttMs.value = now - t
+                    o["server_t"]?.jsonPrimitive?.doubleOrNull?.let { st -> clockOffsetMs = st - (t + now) / 2 }
+                }
+                "burst_detected" -> {
+                    val ts = o["t_server"]?.jsonPrimitive?.doubleOrNull ?: return
+                    val up = o["up_ms"]?.jsonPrimitive?.doubleOrNull ?: return
+                    _burstDetected.value = ts to up
+                }
             }
         }
     }
@@ -91,6 +110,20 @@ class ServerClient(
         put("sco_rt_ms", scoRtMs?.let { JsonPrimitive(it) } ?: JsonNull)
         put("ble_rt_ms", bleRtMs?.let { JsonPrimitive(it) } ?: JsonNull)
         put("ws_rt_ms", wsRtMs?.let { JsonPrimitive(it) } ?: JsonNull)
+    }.toString()))
+
+    fun clearBurst() { _burstDetected.value = null }
+
+    /** Arms the server's detector; [tServerMs] is when the burst left the phone, on the server clock. */
+    suspend fun sendBurst(tServerMs: Double) {
+        _burstDetected.value = null
+        session?.send(WsFrame.Text(buildJsonObject { put("type", "burst"); put("t_server", tServerMs) }.toString()))
+    }
+
+    suspend fun sendE2E(fullRtMs: Double?, downMs: Double?) = session?.send(WsFrame.Text(buildJsonObject {
+        put("type", "e2e")
+        put("full_rt_ms", fullRtMs?.let { JsonPrimitive(it) } ?: JsonNull)
+        put("down_ms", downMs?.let { JsonPrimitive(it) } ?: JsonNull)
     }.toString()))
 
     suspend fun close() { session?.close(); session = null; http.close() }

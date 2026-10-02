@@ -24,6 +24,11 @@
 #include "bt_app_hf.h"
 #include "esp_console.h"
 #include "app_hf_msg_set.h"
+#include "audio_pipe.h"
+#include "ble_gatt.h"
+#include "spp_link.h"
+#include "link_policy.h"
+#include "esp_heap_caps.h"
 
 esp_bd_addr_t peer_addr = {0};
 static char peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
@@ -159,21 +164,57 @@ enum {
 /* handler for bluetooth stack enabled events */
 static void bt_hf_client_hdl_stack_evt(uint16_t event, void *p_param);
 
+/* console: lb <0|1> toggles SCO loopback, stats prints pipeline counters */
+static int cmd_lb(int argc, char **argv)
+{
+    if (argc < 2) { printf("loopback=%d\n", audio_pipe_loopback()); return 0; }
+    audio_pipe_set_loopback(argv[1][0] != '0');
+    return 0;
+}
+static int cmd_stats(int argc, char **argv) { audio_pipe_print_stats(); return 0; }
+static int cmd_batch(int argc, char **argv)
+{
+    if (argc >= 2) audio_pipe_set_spp_batch(atoi(argv[1]));
+    return 0;
+}
+static int cmd_top(int argc, char **argv)
+{
+    static char buf[2048];
+    vTaskGetRunTimeStats(buf);   /* task, abs time, % of total (both cores) */
+    printf("Task            Abs time   %%\n%s", buf);
+    printf("free heap: internal %u, total %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)esp_get_free_heap_size());
+    return 0;
+}
+static void register_callbridge_cmds(void)
+{
+    const esp_console_cmd_t lb = { .command = "lb", .help = "lb <0|1>: SCO loopback off/on", .func = &cmd_lb };
+    const esp_console_cmd_t st = { .command = "stats", .help = "pipeline counters", .func = &cmd_stats };
+    const esp_console_cmd_t top = { .command = "top", .help = "per-task CPU time", .func = &cmd_top };
+    const esp_console_cmd_t batch = { .command = "batch", .help = "batch <n>: audio frames per SPP write", .func = &cmd_batch };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&batch));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&lb));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&st));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&top));
+}
+
 /* Reconnect HFP to the most recently bonded phone. Runs in its own task because connecting
  * from inside the HF init callback fails immediately; a short delay plus a few retries works. */
 static void reconnect_task(void *arg)
 {
-    for (int attempt = 0; attempt < 5; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(attempt == 0 ? 1500 : 4000));
+    /* Android re-pages a lost headset itself within a few seconds. If we page at the same time the
+     * two collide ("HF Client found collision") and Bluedroid backs off for ~60 s. So give the phone
+     * 10 s to come to us first, then page every 10 s for two minutes. */
+    for (int attempt = 0; attempt < 12; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
         if (bt_app_hf_is_connected()) {
             break;
         }
         if (bt_app_hf_is_connecting()) {
             continue; /* phone or a previous attempt is mid-negotiation; wait */
         }
-        ESP_LOGI(BT_HF_TAG, "reconnect attempt %d to %02x:%02x:%02x:%02x:%02x:%02x", attempt + 1,
-                 peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5]);
-        esp_hf_client_connect(peer_addr);
+        esp_err_t err = esp_hf_client_connect(peer_addr);
+        ESP_LOGI(BT_HF_TAG, "reconnect attempt %d to %02x:%02x:%02x:%02x:%02x:%02x: %s", attempt + 1,
+                 peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5], esp_err_to_name(err));
     }
     vTaskDelete(NULL);
 }
@@ -232,6 +273,10 @@ void app_main(void)
     /* create application task */
     bt_app_task_start_up();
 
+    audio_pipe_init();
+    ble_gatt_init();
+    spp_link_init();
+
     /* Bluetooth device name, connection mode and profile set up */
     bt_app_work_dispatch(bt_hf_client_hdl_stack_evt, BT_APP_EVT_STACK_UP, NULL, 0, NULL);
 
@@ -245,6 +290,7 @@ void app_main(void)
 
     /* Register commands */
     register_hfp_hf();
+    register_callbridge_cmds();
     printf("callbridge firmware. `help` lists commands.\n");
 
     // start console REPL
@@ -265,6 +311,7 @@ static void bt_hf_client_hdl_stack_evt(uint16_t event, void *p_param)
         esp_bt_gap_register_callback(esp_bt_gap_cb);
         esp_hf_client_register_callback(bt_app_hf_client_cb);
         esp_hf_client_init();
+        link_policy_init();
 
 #if (CONFIG_EXAMPLE_SSP_ENABLED == true)
     /* Set default parameters for Secure Simple Pairing */

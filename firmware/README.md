@@ -13,10 +13,20 @@ idf.py -p /dev/cu.usbserial-11120 flash monitor
 If the port rejects every `stty`/`tcsetattr` with `Invalid argument`, the
 CP2102N is wedged at the USB level: replug the board.
 
-The board shows up as Classic BT device `callbridge`; pair from the phone.
-Console commands (`help`): `con`/`dis` service-level connection, `cona`/`disa`
-audio connection, `ac`/`rc`/`d <number>` answer/reject/dial.
+The board shows up as Classic BT device `callbridge`; pair from the phone. After
+a reboot it reconnects HFP to the bonded phone by itself (10 s later, to avoid
+colliding with the phone's own re-page).
 
-Audio path: HCI. With a SCO link up the example loops incoming PCM back to the
-phone (milestone 1). BLE GATT service, ADPCM pipeline and stats are next; see
-`../docs/protocol.md`.
+Console commands (`help`): `con`/`dis` service-level connection, `cona`/`disa`
+audio connection, `ac`/`rc`/`d <number>` answer/reject/dial, `lb <0|1>` SCO
+loopback, `stats` pipeline counters, `top` per-task CPU, `batch <n>` audio
+frames per SPP write.
+
+Opening the serial port resets the board (DTR/RTS), so a serial capture is a
+reboot; the HFP link comes back on its own.
+
+Layout: `audio_pipe.c` (SCO ⇄ ADPCM frames ⇄ link, jitter buffer, loopback,
+control messages), `spp_link.c` (Classic SPP server, the Android data path),
+`ble_gatt.c` (GATT service, iOS/discovery path), `link_policy.c` (keeps the
+ACL out of sniff mode via Bluedroid internals; without it ACL data crawls at
+~10 packets/s while HFP is up), `adpcm.c`. Protocol in `../docs/protocol.md`.

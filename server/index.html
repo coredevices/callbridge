@@ -16,18 +16,19 @@
     --sco: #2a78d6;   /* categorical slot 1, blue   */
     --ble: #eb6834;   /* slot 2, orange             */
     --ws:  #1baf7a;   /* slot 3, aqua               */
+    --full: #eda100;  /* slot 4, yellow: measured full loop */
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
       color-scheme: dark;
       --surface: #1a1a19; --surface-2: #242423; --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985; --grid: #333331;
-      --sco: #3987e5; --ble: #d95926; --ws: #199e70;
+      --sco: #3987e5; --ble: #d95926; --ws: #199e70; --full: #c98500;
     }
   }
   :root[data-theme="dark"] {
     color-scheme: dark;
     --surface: #1a1a19; --surface-2: #242423; --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985; --grid: #333331;
-    --sco: #3987e5; --ble: #d95926; --ws: #199e70;
+    --sco: #3987e5; --ble: #d95926; --ws: #199e70; --full: #c98500;
   }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 24px 16px; background: var(--surface); color: var(--text);
@@ -96,6 +97,13 @@
     <div class="tile"><div class="label"><i class="swatch" style="background:var(--ws)"></i>WebSocket · app ⇄ server</div><div class="value" id="v-ws">–</div></div>
   </div>
 
+  <h2 class="sub" style="margin:0 0 8px">Measured with real audio (tone burst detected at the far end)</h2>
+  <div class="tiles">
+    <div class="tile"><div class="label"><i class="swatch" style="background:var(--full)"></i>Full loop · phone → server → phone</div><div class="value" id="v-full">–</div></div>
+    <div class="tile"><div class="label">Up · phone → server (one-way)</div><div class="value" id="v-up">–</div></div>
+    <div class="tile"><div class="label">Down · server → phone (one-way)</div><div class="value" id="v-down">–</div></div>
+  </div>
+
   <div class="card">
     <h2>Round trip by hop over time</h2>
     <div class="chart">
@@ -106,10 +114,11 @@
       <span><i class="swatch" style="background:var(--sco)"></i>SCO</span>
       <span><i class="swatch" style="background:var(--ble)"></i>BLE</span>
       <span><i class="swatch" style="background:var(--ws)"></i>WebSocket</span>
+      <span><i class="swatch" style="background:var(--full)"></i>Full loop (measured)</span>
     </div>
     <details>
       <summary>Table view (last 20 samples)</summary>
-      <table><thead><tr><th>time</th><th>SCO ms</th><th>BLE ms</th><th>WS ms</th><th>total ms</th></tr></thead><tbody id="tbody"></tbody></table>
+      <table><thead><tr><th>time</th><th>SCO ms</th><th>BLE ms</th><th>WS ms</th><th>total ms</th><th>up ms</th><th>down ms</th><th>full ms</th></tr></thead><tbody id="tbody"></tbody></table>
     </details>
   </div>
 
@@ -120,6 +129,7 @@
       <dt>BLE · ESP32 ⇄ app</dt><dd>App writes a ping on the control characteristic; firmware answers with a pong notification. Pending until the GATT service ships.</dd>
       <dt>WebSocket · app ⇄ server</dt><dd>App sends <code>{"type":"ping"}</code>; server echoes <code>pong</code>.</dd>
       <dt>Est. one-way</dt><dd>Half the total round trip. Jitter buffers add on top of this in the real audio path.</dd>
+      <dt>Measured with real audio</dt><dd>The app switches the ESP32 loopback off, plays a 1 kHz burst into the SCO link and notes the time on the server clock (synced via ping/pong). The server decodes the uplink ADPCM frames and detects the burst: <b>up</b>. In echo mode the frames come straight back; the phone hears the burst return through the ESP32: <b>full loop</b>. <b>down</b> = full − up. This is the real pipeline: codec, BLE, jitter buffers, SCO.</dd>
     </dl>
   </div>
 </main>
@@ -130,7 +140,9 @@
     { key: 'sco_rt_ms', name: 'SCO', color: 'var(--sco)' },
     { key: 'ble_rt_ms', name: 'BLE', color: 'var(--ble)' },
     { key: 'ws_rt_ms',  name: 'WebSocket', color: 'var(--ws)' },
+    { key: 'full_rt_ms', name: 'Full loop (measured)', color: 'var(--full)' },
   ];
+  const HOPS = SERIES.slice(0, 3); // the ping-based hops that sum to "total"
   const svg = document.getElementById('chart');
   const tip = document.getElementById('tip');
   const clientSel = document.getElementById('client');
@@ -139,7 +151,7 @@
   let data = { clients: {} }, view = [];
 
   const fmt = v => v == null ? null : (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10);
-  const total = s => SERIES.every(x => s[x.key] == null) ? null : SERIES.reduce((a, x) => a + (s[x.key] ?? 0), 0);
+  const total = s => HOPS.every(x => s[x.key] == null) ? null : HOPS.reduce((a, x) => a + (s[x.key] ?? 0), 0);
   const timeStr = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
   function setTile(id, v, pendingText) {
@@ -164,21 +176,27 @@
     const win = Number(windowSel.value);
     view = c ? (c.history || []).filter(s => now - s.t <= win) : [];
     const last = view[view.length - 1];
+    // e2e reports carry only up/down/full; hop tiles use the latest sample that has hop data
+    const lastHop = [...view].reverse().find(s => HOPS.some(x => s[x.key] != null)) || null;
 
     document.getElementById('status').textContent = c ? (c.online ? `online · ${c.mode} mode` : 'offline') : '';
-    const partial = last && SERIES.some(x => last[x.key] == null);
-    setTile('v-total', last ? total(last) : null, 'no data');
-    setTile('v-oneway', last ? (total(last) == null ? null : total(last) / 2) : null, 'no data');
-    setTile('v-sco', last?.sco_rt_ms, 'pending');
-    setTile('v-ble', last?.ble_rt_ms, 'pending');
-    setTile('v-ws', last?.ws_rt_ms, 'pending');
+    const partial = lastHop && HOPS.some(x => lastHop[x.key] == null);
+    const lastOf = k => { for (let i = view.length - 1; i >= 0; i--) if (view[i][k] != null) return view[i][k]; return null; };
+    setTile('v-full', lastOf('full_rt_ms'), 'not run');
+    setTile('v-up', lastOf('up_ms'), 'not run');
+    setTile('v-down', lastOf('down_ms'), 'not run');
+    setTile('v-total', lastHop ? total(lastHop) : null, 'no data');
+    setTile('v-oneway', lastHop ? (total(lastHop) == null ? null : total(lastHop) / 2) : null, 'no data');
+    setTile('v-sco', lastHop?.sco_rt_ms, 'pending');
+    setTile('v-ble', lastHop?.ble_rt_ms, 'pending');
+    setTile('v-ws', lastHop?.ws_rt_ms, 'pending');
     if (partial) document.getElementById('v-total').title = 'sum of measured hops only';
 
     // table
     const tb = document.getElementById('tbody'); tb.textContent = '';
     for (const s of view.slice(-20).reverse()) {
       const tr = document.createElement('tr');
-      for (const v of [timeStr(s.t), fmt(s.sco_rt_ms), fmt(s.ble_rt_ms), fmt(s.ws_rt_ms), fmt(total(s))]) {
+      for (const v of [timeStr(s.t), fmt(s.sco_rt_ms), fmt(s.ble_rt_ms), fmt(s.ws_rt_ms), fmt(total(s)), fmt(s.up_ms), fmt(s.down_ms), fmt(s.full_rt_ms)]) {
         const td = document.createElement('td'); td.textContent = v == null ? '–' : v; tr.appendChild(td);
       }
       tb.appendChild(tr);
@@ -215,6 +233,7 @@
       }
       if (!d.trim()) continue;
       el('path', { d, stroke: x.color }, sg);
+      if (x.key === 'full_rt_ms') for (const s of view) if (s[x.key] != null) el('circle', { cx: X(s.t), cy: Y(s[x.key]), r: 4, fill: x.color }, sg);
       if (lastPt) el('text', { class: 'end', x: lastPt[0] + 6, y: lastPt[1] + 4 }, sg).textContent = `${x.name} ${fmt(lastPt[2])}`;
     }
     el('line', { class: 'crosshair', id: 'xh', y1: PAD.t, y2: H - PAD.b }, svg);

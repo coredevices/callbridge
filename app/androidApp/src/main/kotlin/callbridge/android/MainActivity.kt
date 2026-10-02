@@ -26,7 +26,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,7 +33,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import callbridge.BleState
 import callbridge.Control
@@ -65,7 +63,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 when {
                     denied -> Text("Bluetooth permission required. Grant it in Settings and relaunch.", Modifier.safeContentPadding())
-                    else -> service?.let { Screen(it.session) } ?: Text("starting…", Modifier.safeContentPadding())
+                    else -> service?.let { Screen(it) } ?: Text("starting…", Modifier.safeContentPadding())
                 }
             }
         }
@@ -81,22 +79,24 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun Screen(session: Session) {
+fun Screen(service: RelayService) {
+    val session = service.session
+    val sco = service.sco
     val ble by session.ble.collectAsState()
     val server by session.server.collectAsState()
     val stats by session.stats.collectAsState()
     val latency by session.latency.collectAsState()
     val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-    val sco = remember { ScoTester(context) }
-    DisposableEffect(sco) { onDispose { sco.closeNow() } }
     var scoOpen by remember { mutableStateOf(false) }
     var scoBusy by remember { mutableStateOf(false) }
     var scoStatus by remember { mutableStateOf("") }
+    var e2eStatus by remember { mutableStateOf("") }
     var serverUrl by remember { mutableStateOf("ws://127.0.0.1:8080/ws") } // adb reverse tcp:8080 tcp:8765
     var room by remember { mutableStateOf("demo") }
     var echo by remember { mutableStateOf(true) }
-    var loopback by remember { mutableStateOf(false) }
+    var loopback by remember { mutableStateOf(true) }   // firmware default
+    var blast by remember { mutableStateOf(false) }
+    fun ms(v: Double?) = v?.let { "%.0f ms".format(it) } ?: "pending"
     val bleBusy = ble is BleState.Connecting
     val serverBusy = server is ServerState.Connecting
 
@@ -111,10 +111,7 @@ fun Screen(session: Session) {
             Button(onClick = { scope.launch { session.disconnectBle() } }) { Text("Disconnect ESP32") }
         } else {
             Button(enabled = !bleBusy, onClick = {
-                scope.launch {
-                    val adv = runCatching { withTimeout(10_000) { scanCallbridge().first() } }.getOrNull()
-                    if (adv == null) scoStatus = "no callbridge advertisement seen in 10 s" else session.connectBle(adv)
-                }
+                scope.launch { runCatching { service.connectAny() }.onFailure { scoStatus = it.message ?: it.toString() } }
             }) { Text("Scan + connect ESP32") }
         }
 
@@ -126,7 +123,7 @@ fun Screen(session: Session) {
             Button(onClick = { scope.launch { session.disconnectServer() } }) { Text("Stop relay") }
         } else {
             Button(enabled = !serverBusy, onClick = {
-                scope.launch { session.connectServer(serverUrl, if (echo) "echo" else "room", room, 500) }
+                scope.launch { session.connectServer(serverUrl, if (echo) "echo" else "room", room, 0) }
             }) { Text("Start relay") }
         }
 
@@ -138,8 +135,12 @@ fun Screen(session: Session) {
         }
         Row {
             Text("ESP loopback")
-            Switch(loopback, { loopback = it; scope.launch { session.sendControl(Control.loopback(it)) } }, enabled = ble is BleState.Connected)
+            Switch(loopback, { loopback = it; session.loopbackWanted = it; scope.launch { session.sendControl(Control.loopback(it)) } }, enabled = ble is BleState.Connected)
+            Spacer(Modifier.padding(8.dp))
+            Text("BLE blast")
+            Switch(blast, { blast = it; scope.launch { session.sendControl(Control.blast(it)) } }, enabled = ble is BleState.Connected)
         }
+        Text("BLE audio_tx: ${stats.bleFramesPerSec} frames/s, %.1f kbps".format(stats.bleKbps))
 
         Spacer(Modifier.height(12.dp))
         Text("SCO test (no call needed; ESP loopback must be on)", style = MaterialTheme.typography.titleSmall)
@@ -170,10 +171,25 @@ fun Screen(session: Session) {
         Text(scoStatus)
 
         Spacer(Modifier.height(12.dp))
+        Text("End-to-end test (real audio)", style = MaterialTheme.typography.titleSmall)
+        Text("Needs ESP32 + server + SCO up. Plays a tone into the call path; the server detects it on the way up, the phone hears it come back.", style = MaterialTheme.typography.bodySmall)
+        Button(enabled = scoOpen && !scoBusy && ble is BleState.Connected && server is ServerState.Connected, onClick = {
+            scope.launch {
+                android.util.Log.i("callbridge", "e2e button clicked")
+                scoBusy = true; e2eStatus = "running…"
+                val r = runCatching { session.runE2E { onFired -> sco.fireAndListen(onFired = onFired) } }
+                    .getOrElse { callbridge.E2EResult(null, null, null, it.message ?: it.toString()) }
+                e2eStatus = "up %s · down %s · full loop %s · %s".format(ms(r.upMs), ms(r.downMs), ms(r.fullRtMs), r.message)
+                scoBusy = false
+            }
+        }) { Text("Run end-to-end test") }
+        Text(e2eStatus)
+
+        Spacer(Modifier.height(12.dp))
         Text("Latency (round trip)", style = MaterialTheme.typography.titleSmall)
-        fun ms(v: Double?) = v?.let { "%.0f ms".format(it) } ?: "pending"
         Text("SCO phone⇄ESP ${ms(latency.scoRtMs)} · BLE ESP⇄app ${ms(latency.bleRtMs)} · WS app⇄server ${ms(latency.wsRtMs)}")
         Text("total ${ms(latency.totalRtMs)}, est. one-way ${ms(latency.totalRtMs?.div(2))}")
+        Text("measured: up ${ms(latency.upMs)} · down ${ms(latency.downMs)} · full loop ${ms(latency.fullRtMs)}")
 
         Spacer(Modifier.height(12.dp))
         Text("up   ESP→server: ${stats.espToServer} frames, lost ${stats.lostFromEsp}")

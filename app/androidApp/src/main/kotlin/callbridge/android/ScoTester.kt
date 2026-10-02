@@ -49,6 +49,8 @@ class ScoTester(private val context: Context) {
             try {
                 am.mode = AudioManager.MODE_IN_COMMUNICATION
                 if (!am.setCommunicationDevice(dev)) error("setCommunicationDevice refused")
+                // the tone we play is scaled by the voice-call volume; at its default it reaches the ESP32 ~43 dB down
+                am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0)
                 val minRec = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                 @Suppress("MissingPermission")
                 r = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minRec * 4)
@@ -125,8 +127,42 @@ class ScoTester(private val context: Context) {
                     readFully(r, ShortArray(RATE / 2))
                 }
             }
-            if (closeRequested) closeLocked()
-            results.sorted().getOrNull(results.size / 2)
+            results.sorted().getOrNull(results.size / 2).also { if (closeRequested) closeLocked() }
+        }
+    }
+
+    /**
+     * One burst for the end-to-end test: drain, call [onFired] the instant the burst is written,
+     * then listen up to [listenMs] for the tone to come back. Returns ms from firing to detection.
+     */
+    suspend fun fireAndListen(listenMs: Int = 3000, onFired: suspend () -> Unit): Double? = withContext(Dispatchers.IO) {
+        lock.withLock {
+            val r = rec ?: return@withLock null
+            val t = track ?: return@withLock null
+            val chunk = ShortArray(CHUNK)
+            drain(r, chunk)
+            val idle = ShortArray(CHUNK * 20); readFully(r, idle)
+            val floor = (0 until 20).maxOf { goertzel(idle, it * CHUNK, CHUNK) }
+            val threshold = maxOf(floor * 8, MIN_LEVEL)
+            drain(r, chunk)
+            try {
+                // arm first, then emit: both the server's "up" and the phone's "full" are anchored at the
+                // same instant (the drain just above = sample 0 of the listen window)
+                val burst = tone()
+                onFired()
+                t.write(burst, 0, burst.size)
+                val window = ShortArray(RATE * listenMs / 1000)
+                var filled = 0
+                while (filled < window.size) {
+                    val n = r.read(window, filled, CHUNK)
+                    if (n <= 0) break
+                    if (goertzel(window, filled, n) > threshold) return@withLock filled * 1000.0 / RATE
+                    filled += n
+                }
+                null
+            } finally {
+                if (closeRequested) closeLocked()
+            }
         }
     }
 
@@ -161,7 +197,7 @@ class ScoTester(private val context: Context) {
         const val RATE = 16_000
         const val CHUNK = RATE / 100       // 10 ms
         const val TONE_HZ = 1000.0
-        const val BURST_MS = 60
+        const val BURST_MS = 100   // 5 frames: survives one lost 3-frame batch on the link
         const val MIN_LEVEL = 0.002
     }
 }

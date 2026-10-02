@@ -24,6 +24,7 @@ class Frame(
         const val HEADER = 6
         const val CODEC_ADPCM_8K = 0x01
         const val CODEC_ADPCM_16K = 0x02
+        const val CODEC_BLAST = 0xFF
 
         fun decode(b: ByteArray): Frame? {
             if (b.size < HEADER) return null

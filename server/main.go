@@ -31,21 +31,32 @@ type hello struct {
 	Name    string `json:"name"`
 }
 
-// control is any text message after hello: ping (echoed as pong) or a latency report.
+// control is any text message after hello: ping (echoed as pong), a latency report,
+// burst (arms the tone detector; t_server = client's estimate of the emit time on the
+// server clock), inject (server plays a tone burst into the return stream) or an e2e
+// result measured by the client.
 type control struct {
-	Type string   `json:"type"`
-	T    float64  `json:"t"`
-	Sco  *float64 `json:"sco_rt_ms"`
-	Ble  *float64 `json:"ble_rt_ms"`
-	Ws   *float64 `json:"ws_rt_ms"`
+	Type    string   `json:"type"`
+	T       float64  `json:"t"`
+	TServer float64  `json:"t_server"`
+	Sco     *float64 `json:"sco_rt_ms"`
+	Ble     *float64 `json:"ble_rt_ms"`
+	Ws      *float64 `json:"ws_rt_ms"`
+	FullRt  *float64 `json:"full_rt_ms"`
+	Down    *float64 `json:"down_ms"`
 }
 
 // latencySample is one report from a client; nil sections are unmeasured.
+// sco/ble/ws are per-hop round trips from pings. up/down/full are measured with a real
+// tone burst detected at the far end (docs/protocol.md "Latency").
 type latencySample struct {
-	T   int64    `json:"t"` // unix ms, server clock
-	Sco *float64 `json:"sco_rt_ms"`
-	Ble *float64 `json:"ble_rt_ms"`
-	Ws  *float64 `json:"ws_rt_ms"`
+	T      int64    `json:"t"` // unix ms, server clock
+	Sco    *float64 `json:"sco_rt_ms"`
+	Ble    *float64 `json:"ble_rt_ms"`
+	Ws     *float64 `json:"ws_rt_ms"`
+	Up     *float64 `json:"up_ms"`
+	Down   *float64 `json:"down_ms"`
+	FullRt *float64 `json:"full_rt_ms"`
 }
 
 type clientStats struct {
@@ -119,8 +130,9 @@ func (s *statsStore) snapshot() map[string]*clientStats {
 }
 
 type client struct {
-	conn *websocket.Conn
-	out  chan []byte // frames to send; dropped when full
+	conn         *websocket.Conn
+	out          chan []byte // frames to send; dropped when full
+	burstArmedAt float64     // server-clock ms the client says it emitted the burst
 }
 
 type rooms struct {
@@ -220,6 +232,14 @@ func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 			return
 		}
 		c := &client{conn: conn, out: make(chan []byte, 256)}
+		det := &detector{rate: 16000}
+		var dbgFrames int
+		det.debug = func(m, th float64, n, rate int) {
+			if dbgFrames++; dbgFrames%5 == 1 || m > th {
+				log.Printf("client %s: armed frame %d: level %.4f threshold %.4f (%d samples @ %d Hz)", req.RemoteAddr, dbgFrames, m, th, n, rate)
+			}
+		}
+		var lastUp *float64 // carried into the next periodic sample so the page can plot it
 		go c.writer(ctx)
 		c.send([]byte(`{"type":"ok"}`), true)
 
@@ -248,16 +268,46 @@ func serveWS(r *rooms, st *statsStore) http.HandlerFunc {
 				}
 				switch m.Type {
 				case "ping":
-					pong, _ := json.Marshal(map[string]any{"type": "pong", "t": m.T})
+					pong, _ := json.Marshal(map[string]any{"type": "pong", "t": m.T, "server_t": float64(time.Now().UnixMicro()) / 1000})
 					c.send(pong, true)
 				case "latency":
 					st.record(id, clientStats{Name: h.Name, Mode: h.Mode, Online: true},
-						&latencySample{T: time.Now().UnixMilli(), Sco: validMs(m.Sco), Ble: validMs(m.Ble), Ws: validMs(m.Ws)})
+						&latencySample{T: time.Now().UnixMilli(), Sco: validMs(m.Sco), Ble: validMs(m.Ble), Ws: validMs(m.Ws), Up: lastUp})
+					lastUp = nil
+				case "burst":
+					dbgFrames = 0
+					// the read loop owns the detector; expiry is checked here, not from a timer goroutine
+					det.armed = true
+					det.deadline = time.Now().Add(3 * time.Second)
+					c.burstArmedAt = m.TServer
+				case "inject":
+					// play a tone burst towards the client; it detects it at the phone
+					now := float64(time.Now().UnixMicro()) / 1000
+					for _, f := range encodeFrames(tone(det.rate), det.rate, 0xFFF0) {
+						c.send(f, false)
+					}
+					msg, _ := json.Marshal(map[string]any{"type": "injected", "t_server": now})
+					c.send(msg, true)
+				case "e2e":
+					st.record(id, clientStats{Name: h.Name, Mode: h.Mode, Online: true},
+						&latencySample{T: time.Now().UnixMilli(), FullRt: validMs(m.FullRt), Down: validMs(m.Down), Up: lastUp})
+					lastUp = nil
 				}
 				continue
 			}
 			if typ != websocket.MessageBinary {
 				continue
+			}
+			if det.armed && time.Now().After(det.deadline) {
+				det.armed = false
+			}
+			if det.feed(data) {
+				now := float64(time.Now().UnixMicro()) / 1000
+				up := now - c.burstArmedAt
+				lastUp = &up
+				msg, _ := json.Marshal(map[string]any{"type": "burst_detected", "t_server": now, "up_ms": up})
+				c.send(msg, true)
+				log.Printf("client %s: burst detected, up %.0f ms", id, up)
 			}
 			switch h.Mode {
 			case "echo":

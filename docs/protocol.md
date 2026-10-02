@@ -63,6 +63,34 @@ app → ESP (write):
 | 0x13 | dial: ASCII number            |
 | 0x14 | request stats (ESP replies 0x03) |
 | 0x15 | ping: u32 token (ESP replies 0x04 immediately) |
+| 0x16 | blast: u8 (0 off, 1 on). Throughput test: ESP streams 244-byte frames with codec 0xFF at max rate on `audio_tx` |
+
+## Bluetooth Classic SPP (ESP32 ⇄ Android app)
+
+Measured on the ESP32-WROVER-E: with an eSCO link active, BLE delivers only
+~10 of 50 frames/s (~13 kbps) because BR/EDR and BLE time-share one radio.
+So on Android the data path is an RFCOMM/SPP stream instead, which lives in
+the same piconet as the HFP link. Firmware runs an SPP server named
+`callbridge` (standard SPP UUID `00001101-0000-1000-8000-00805F9B34FB`);
+the app discovers the device over BLE (same address) and then opens SPP, after
+which the BLE link is not used. iOS (no third-party SPP) uses the GATT path.
+
+Two link-level facts shape this path (measured, not from the datasheet):
+
+- Both Bluedroid stacks put an idle HFP ACL into **sniff mode** (495 ms
+  interval); ACL data then moves only at anchor points. Firmware removes sniff
+  from its link policy (`link_policy.c`).
+- With SCO active the link carries on the order of **25–50 packets/s total**,
+  regardless of packet size, so both ends batch 3 audio frames per SPP write
+  (+40 ms latency). Full-duplex traffic still exceeds the budget today.
+
+Stream framing, both directions (several records may share one write):
+
+| off | size | field     |
+|-----|------|-----------|
+| 0   | 1    | channel: 0 audio frame, 1 control message |
+| 1   | 2    | payload length, u16 LE (≤ 1024)           |
+| 3   | n    | payload, exactly as on the GATT characteristics |
 
 ## WebSocket (app ⇄ server)
 
@@ -89,7 +117,18 @@ After hello, the client may send:
 - `{"type":"ping","t":<any number>}` → server replies `{"type":"pong","t":<same>}`.
 - `{"type":"latency","sco_rt_ms":n|null,"ble_rt_ms":n|null,"ws_rt_ms":n|null}`
   every ~2 s. The server keeps the last 30 min per client and serves them at
-  `GET /stats` (JSON) and on the page at `GET /` (per-hop tiles + time series). Frames returned by the server keep the sender's `seq`; the app does
+  `GET /stats` (JSON) and on the page at `GET /` (per-hop tiles + time series).
+- `{"type":"burst","t_server":ms}` arms the server's 1 kHz detector for 3 s;
+  `t_server` is the client's estimate (server clock) of when the burst left the
+  phone. On detection the server sends
+  `{"type":"burst_detected","t_server":ms,"up_ms":n}`.
+- `{"type":"inject"}` makes the server send a 60 ms 1 kHz burst (3 ADPCM frames,
+  seq from 0xFFF0) into the return stream and reply `{"type":"injected","t_server":ms}`.
+- `{"type":"e2e","full_rt_ms":n|null,"down_ms":n|null}` reports the phone-side
+  result of an end-to-end test.
+
+`pong` carries `server_t` (server clock, ms) so the client can compute a clock
+offset: `offset = server_t - (t_sent + t_recv) / 2`. Frames returned by the server keep the sender's `seq`; the app does
 not renumber.
 
 ## Timing / buffering
@@ -111,3 +150,21 @@ their sum. Jitter buffers add on top of these in the real audio path.
 | WebSocket app ⇄ server | JSON ping / pong | app, every 2 s |
 
 Full-path one-way estimate = total round trip / 2.
+
+### Measured with real audio
+
+The ping numbers only estimate. The end-to-end test injects a real tone and
+detects it at the far end:
+
+1. App switches the ESP32 loopback off (control 0x12) so the only way back is
+   through the server, drains its recorder, writes a 60 ms 1 kHz burst to the
+   SCO link and sends `burst` with the emit time on the server clock.
+2. ESP32 encodes the burst → BLE → app → WS. The server decodes every uplink
+   frame, keeps a rolling 1 kHz noise floor and reports **up** (one-way
+   phone → server) on the first frame that clears 8× the floor.
+3. In echo mode (delay 0) the frames return → app → BLE → ESP32 → SCO; the app
+   detects the burst in its microphone stream: **full loop**.
+4. **down** = full loop − up. Results go to the server (`e2e`) and the page.
+
+Firmware encoder resets ADPCM state every frame (predictor 0, index 0) so each
+frame is self-contained, as the header allows.
