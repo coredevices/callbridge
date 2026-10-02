@@ -20,7 +20,7 @@ bool opus_link_init(void)
     ec.bits_per_sample = 16;
     ec.bitrate = OPUS_LINK_BITRATE;
     ec.frame_duration = ESP_OPUS_ENC_FRAME_DURATION_20_MS;
-    ec.application_mode = ESP_OPUS_ENC_APPLICATION_VOIP;
+    ec.application_mode = ESP_OPUS_ENC_APPLICATION_LOWDELAY;   /* CELT only: far cheaper than SILK on the ESP32 */
     ec.complexity = 0;          /* complexity 2 took 32 ms per 20 ms frame at 160 MHz with state in PSRAM */
     ec.enable_vbr = false;      /* CBR: every frame is exactly 40 bytes, so packing is predictable */
     ec.enable_fec = false;

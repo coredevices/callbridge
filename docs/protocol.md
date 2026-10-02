@@ -53,7 +53,9 @@ First byte is the type. ESP → app (notify/read):
 | 0x03 | stats: u32 tx_frames, u32 rx_frames, u32 rx_lost, u32 rx_late, u32 sco_drops |
 | 0x04 | pong: u32 token (echo of 0x15)                         |
 
-app → ESP (write):
+app → ESP: written to `audio_rx` as a record `[0x00][0x00][0xC0][message]`
+(write without response; a write-with-response on `control` would stall the
+audio writes Android queues behind it). Messages:
 
 | type | body                          |
 |------|-------------------------------|

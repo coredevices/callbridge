@@ -33,6 +33,7 @@
       <option value="app">phone app (no dongle): run scripts/cmd.sh appecho</option>
       <option value="full" selected>dongle + phone (full path): scripts/cmd.sh scoecho</option>
     </select></label>
+    <label>Codec <select id="codec"><option value="opus" selected>Opus 16 kbps (link format)</option><option value="adpcm">ADPCM 8 kHz (old)</option></select></label>
     <label>Room <input id="room" value="demo" size="10"></label>
     <label>Jitter target <select id="jitter"><option value="40">40 ms</option><option value="60" selected>60 ms</option><option value="100">100 ms</option></select></label>
     <label>Mic gain <select id="gain"><option value="1">1x</option><option value="2">2x</option><option value="4" selected>4x</option><option value="8">8x</option></select></label>
@@ -52,7 +53,7 @@
   </div>
 
   <div class="card how">
-    <b>Use headphones</b> on the laptop or the phone side will hear itself. Audio is 8 kHz IMA ADPCM in 20 ms frames, the same format the dongle sends; the server relays frames between everyone in the room without touching them.
+    <b>Use headphones</b> on the laptop or the phone side will hear itself. Audio is Opus at 16 kbps in 20 ms frames (40 bytes), the same format the dongle sends over BLE; the server and the phone app relay frames without touching them.
   </div>
 </main>
 
@@ -120,12 +121,64 @@
     requestAnimationFrame(drawGraph);
   }
   requestAnimationFrame(drawGraph);
-  const q = [];          // decoded 8 kHz frames waiting for playback
-  let qSamples = 0, started = false;
   const $ = id => document.getElementById(id);
+  const CODEC_OPUS = 3;
+  // playback queue: Float32 chunks at the AudioContext rate
+  const q = [];
+  let qSamples = 0, started = false, encoder = null, decoder = null, decTs = 0;
+
+  function resample(f32, from, to) {
+    if (from === to) return f32;
+    const n = Math.round(f32.length * to / from), out = new Float32Array(n), r = from / to;
+    for (let i = 0; i < n; i++) {
+      const x = i * r, i0 = Math.floor(x), t = x - i0;
+      out[i] = (f32[i0] || 0) * (1 - t) + (f32[Math.min(i0 + 1, f32.length - 1)] || 0) * t;
+    }
+    return out;
+  }
+  function enqueue(f32) {
+    let peak = 0; for (const v of f32) peak = Math.max(peak, Math.abs(v));
+    $('m-down').style.width = (peak * 100) + '%';
+    lastDownPeak = Math.max(lastDownPeak, peak);
+    q.push(f32); qSamples += f32.length;
+    const cap = ctx.sampleRate * (Number($('jitter').value) * 2) / 1000;   // never buffer more than 2x the target
+    while (qSamples > cap) { const old = q.shift(); qSamples -= old.length; }
+  }
 
   async function join() {
     const room = $('room').value || 'demo';
+    const codec = $('codec').value;
+    ctx = new AudioContext();
+    const R = ctx.sampleRate, FR = R / 50;   // samples per 20 ms at the context rate
+
+    if (codec === 'opus') {
+      if (!('AudioEncoder' in window)) throw new Error('this browser has no WebCodecs; use Chrome');
+      encoder = new AudioEncoder({
+        output: chunk => {
+          const out = new Uint8Array(HDR + chunk.byteLength);
+          out[0] = seq & 0xff; out[1] = (seq >> 8) & 0xff; out[2] = CODEC_OPUS;
+          chunk.copyTo(out.subarray(HDR));
+          if (ws && ws.readyState === 1) { ws.send(out); stats.tx++; }
+          seq = (seq + 1) & 0xffff;
+        },
+        error: e => { $('status').textContent = 'encoder: ' + e.message; },
+      });
+      const cfg = { codec: 'opus', sampleRate: R, numberOfChannels: 1, bitrate: 16000, bitrateMode: 'constant', opus: { frameDuration: 20000, complexity: 5 } };
+      const ok = await AudioEncoder.isConfigSupported(cfg);
+      if (!ok.supported) { delete cfg.opus; delete cfg.bitrateMode; }
+      encoder.configure(cfg);
+      decoder = new AudioDecoder({
+        output: ad => {
+          const f = new Float32Array(ad.numberOfFrames);
+          ad.copyTo(f, { planeIndex: 0, format: 'f32-planar' });
+          const rate = ad.sampleRate; ad.close();
+          enqueue(resample(f, rate, R));
+        },
+        error: e => { $('status').textContent = 'decoder: ' + e.message; },
+      });
+      decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+    }
+
     ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
     ws.binaryType = 'arraybuffer';
     const mode = $('echoat').value === 'server' ? 'echo' : 'room';
@@ -138,68 +191,76 @@
         if (m.type === 'error') $('status').textContent = m.message;
         return;
       }
-      const f = new Uint8Array(e.data), pcm = decodeFrame(f);
-      if (!pcm) return;
+      const f = new Uint8Array(e.data);
+      if (f.length < HDR) return;
       const s = f[0] | (f[1] << 8);
       if (stats.lastSeq >= 0) { const d = (s - stats.lastSeq) & 0xffff; if (d > 1 && d < 32768) stats.lost += d - 1; }
-      stats.lastSeq = s; stats.rx++;
-      q.push(pcm); qSamples += pcm.length;
-      const cap = RATE * (Number($('jitter').value) * 2) / 1000;   // never buffer more than 2x the target
-      while (qSamples > cap) { const old = q.shift(); qSamples -= old.length; }
-      let peak = 0; for (const v of pcm) peak = Math.max(peak, Math.abs(v));
-      $('m-down').style.width = (peak / 327.67) + '%';
-      lastDownPeak = peak / 32768; stats.rxSec++;
+      stats.lastSeq = s; stats.rx++; stats.rxSec++;
+      if (f[2] === CODEC_OPUS && decoder) {
+        decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: decTs, data: f.subarray(HDR) }));
+        decTs += 20000;
+      } else if (f[2] === CODEC_8K) {
+        const pcm = decodeFrame(f);
+        if (!pcm) return;
+        const fl = new Float32Array(pcm.length); for (let i = 0; i < pcm.length; i++) fl[i] = pcm[i] / 32768;
+        enqueue(resample(fl, RATE, R));
+      }
     };
     ws.onclose = () => { $('status').textContent = 'disconnected'; };
 
-    ctx = new AudioContext();
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
     mic = ctx.createMediaStreamSource(stream);
-    const ratio = ctx.sampleRate / RATE;               // e.g. 48000/8000 = 6
     proc = ctx.createScriptProcessor(1024, 1, 1);
-    let acc = new Int16Array(FRAME), accN = 0, carry = 0;
-    let play = null, playPos = 0, phase = 0, last = 0;
+    let acc = new Float32Array(FR), accN = 0, encTs = 0;
+    let play = null, playPos = 0;
     proc.onaudioprocess = ev => {
-      // --- capture: average groups of `ratio` samples down to 8 kHz, pack 20 ms frames, send
+      // --- capture: 20 ms chunks at the context rate, gain applied, then encode
       const inp = ev.inputBuffer.getChannelData(0);
-      let peak = 0;
       const gain = Number($('gain').value);
-      for (let i = 0; i < inp.length; i += ratio) {
-        let sum = 0; for (let k = 0; k < ratio; k++) sum += inp[i + k] || 0;
-        const v = Math.max(-32768, Math.min(32767, Math.round(sum / ratio * gain * 32767)));
+      let peak = 0;
+      for (let i = 0; i < inp.length; i++) {
+        const v = Math.max(-1, Math.min(1, inp[i] * gain));
         acc[accN++] = v; peak = Math.max(peak, Math.abs(v));
-        if (accN === FRAME) {
-          if (ws && ws.readyState === 1) { ws.send(encodeFrame(acc, seq)); seq = (seq + 1) & 0xffff; stats.tx++; }
-          let fp = 0; for (let k = 0; k < FRAME; k++) fp = Math.max(fp, Math.abs(acc[k]));
-          upHist[histPos] = fp / 32768; downHist[histPos] = lastDownPeak; lastDownPeak = 0; histPos = (histPos + 1) % HIST;
+        if (accN === FR) {
+          if (codec === 'opus') {
+            if (encoder && encoder.state === 'configured') {
+              const ad = new AudioData({ format: 'f32-planar', sampleRate: R, numberOfFrames: FR, numberOfChannels: 1, timestamp: encTs, data: acc.slice() });
+              encoder.encode(ad); ad.close(); encTs += 20000;
+            }
+          } else if (ws && ws.readyState === 1) {
+            const lo = resample(acc, R, RATE), pcm = new Int16Array(FRAME);
+            for (let k = 0; k < FRAME; k++) pcm[k] = Math.round((lo[k] || 0) * 32767);
+            ws.send(encodeFrame(pcm, seq)); seq = (seq + 1) & 0xffff; stats.tx++;
+          }
+          let fp = 0; for (let k = 0; k < FR; k++) fp = Math.max(fp, Math.abs(acc[k]));
+          upHist[histPos] = fp; downHist[histPos] = lastDownPeak; lastDownPeak = 0; histPos = (histPos + 1) % HIST;
           accN = 0;
         }
       }
-      $('m-up').style.width = (peak / 327.67) + '%';
-      // --- playback: wait for the jitter target, then pull 8 kHz samples and upsample linearly
+      $('m-up').style.width = (peak * 100) + '%';
+      // --- playback: start once the jitter target is buffered, play underruns as silence
       const out = ev.outputBuffer.getChannelData(0);
-      const target = RATE * Number($('jitter').value) / 1000;
+      const target = R * Number($('jitter').value) / 1000;
       if (!started && qSamples >= target) started = true;
       for (let i = 0; i < out.length; i++) {
-        if (phase === 0) {
-          if (!play || playPos >= play.length) {
-            if (started && q.length) { play = q.shift(); qSamples -= play.length; playPos = 0; }
-            else { play = null; if (started) { stats.under++; started = false; } }
-          }
-          last = play ? play[playPos++] / 32768 : last * 0.9;
+        if (!play || playPos >= play.length) {
+          if (started && q.length) { play = q.shift(); qSamples -= play.length; playPos = 0; }
+          else { play = null; if (started) { stats.under++; started = false; } }
         }
-        out[i] = last;
-        phase = (phase + 1) % ratio;
+        out[i] = play ? play[playPos++] : 0;
       }
     };
     mic.connect(proc); proc.connect(ctx.destination);
     $('join').disabled = true; $('leave').disabled = false;
     $('status').textContent = `joining "${room}"…`;
     setInterval(() => { stats.rxRate = stats.rxSec * 2; stats.rxSec = 0; }, 500);
-    setInterval(() => { $('stats').textContent = `sent ${stats.tx} · received ${stats.rx} (${stats.rxRate}/s, 50 = full) · lost ${stats.lost} · buffer ${Math.round(qSamples / 8)} ms · underruns ${stats.under} · audio ${ctx.sampleRate} Hz`; }, 500);
+    setInterval(() => { $('stats').textContent = `${codec} · sent ${stats.tx} · received ${stats.rx} (${stats.rxRate}/s, 50 = full) · lost ${stats.lost} · buffer ${Math.round(qSamples / R * 1000)} ms · underruns ${stats.under}`; }, 500);
   }
   function leave() {
-    ws && ws.close(); proc && proc.disconnect(); mic && mic.disconnect(); ctx && ctx.close();
+    ws && ws.close(); proc && proc.disconnect(); mic && mic.disconnect();
+    try { encoder && encoder.close(); decoder && decoder.close(); } catch (e) {}
+    encoder = decoder = null; q.length = 0; qSamples = 0; started = false;
+    ctx && ctx.close();
     $('join').disabled = false; $('leave').disabled = true; $('status').textContent = 'idle';
   }
   $('join').onclick = () => join().catch(e => { $('status').textContent = e.message; });

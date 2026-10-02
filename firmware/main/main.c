@@ -206,7 +206,7 @@ static void opustest_task(void *arg)
 {
     static int16_t pcm[OPUS_LINK_SAMPLES], out[OPUS_LINK_SAMPLES];
     uint8_t pkt[OPUS_LINK_MAX];
-    for (int i = 0; i < OPUS_LINK_SAMPLES; i++) pcm[i] = (int16_t)(8000 * sinf(2 * 3.14159f * 1000 * i / 16000));
+    for (int i = 0; i < OPUS_LINK_SAMPLES; i++) pcm[i] = (int16_t)(8000 * sinf(2 * 3.14159f * 1000 * i / OPUS_LINK_RATE));
     printf("internal free %u, psram free %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     int64_t te = 0, td = 0; int bytes = 0, ok = 0;
     for (int f = 0; f < 50; f++) {

@@ -71,5 +71,8 @@ class BleTransport(private val peripheral: Peripheral) : Link {
         }
         if (buf.isNotEmpty()) peripheral.write(CallbridgeGatt.AUDIO_RX, buf, WriteType.WithoutResponse)
     }
-    override suspend fun sendControl(msg: ByteArray) = peripheral.write(CallbridgeGatt.CONTROL, msg, WriteType.WithResponse)
+    // Control goes over the audio characteristic as a [0, 0, 0xC0, msg...] record, write-without-response:
+    // Android serializes GATT operations, so a write waiting for the dongle's reply would hold up every
+    // audio write queued behind it. (The control characteristic stays for notifications from the dongle.)
+    override suspend fun sendControl(msg: ByteArray) = sendAudioBatch(listOf(byteArrayOf(0, 0, 0xC0.toByte()) + msg))
 }

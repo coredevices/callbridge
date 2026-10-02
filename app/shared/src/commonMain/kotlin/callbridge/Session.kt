@@ -225,7 +225,7 @@ class Session(private val scope: CoroutineScope) {
             // BLE ping every 2 s; stays null until the firmware answers (GATT milestone).
             var token = 0
             while (true) {
-                delay(2_000)
+                delay(5_000)   // diagnostics only; every write competes with audio for connection events
                 token++
                 pendingPing = PendingPing(token, nowMs())
                 try {

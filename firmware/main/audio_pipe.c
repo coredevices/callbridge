@@ -272,8 +272,16 @@ void audio_pipe_call_state(uint8_t state)
 
 /* ---- BLE rx ---- */
 
+#define CODEC_CONTROL    0xC0   /* downlink record carrying a control message from byte 3 on */
+
 void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
 {
+    if (len >= 4 && f[2] == CODEC_CONTROL) {
+        /* control over the audio characteristic: write-without-response, so it never holds up audio
+         * behind a GATT response (and Android's cached GATT table needs no change) */
+        audio_pipe_control(f + 3, len - 3);
+        return;
+    }
     s_st.link_rx_bytes += len;
     if (s_link_echo) {
         /* link test: hand the frame to the pipeline task, which owns the link batch buffer */
@@ -422,12 +430,17 @@ static void dec_task(void *arg)
         int got = opus_link_decode(it.data + FRAME_HDR, it.len - FRAME_HDR, pcm);
         if (got <= 0) { s_st.rx_late++; continue; }
         size_t samples = got;
-        if (!s_msbc) {   /* narrowband call: 16 kHz -> 8 kHz */
-            for (size_t i = 0; i < samples / 2; i++) pcm[i] = (int16_t)((pcm[2 * i] + pcm[2 * i + 1]) / 2);
-            samples /= 2;
+        static int16_t wb[OPUS_LINK_SAMPLES * 2];
+        const int16_t *outp = pcm;
+        if (s_msbc) {   /* wideband call: 8 kHz -> 16 kHz, linear interpolation */
+            for (size_t i = 0; i < samples; i++) {
+                int16_t a = pcm[i], b = i + 1 < samples ? pcm[i + 1] : pcm[i];
+                wb[2 * i] = a; wb[2 * i + 1] = (int16_t)((a + b) / 2);
+            }
+            samples *= 2; outp = wb;
         }
         out_prefill_if_empty();
-        out_write((uint8_t *)pcm, samples * 2, JITTER_MAX_MS);
+        out_write((uint8_t *)outp, samples * 2, JITTER_MAX_MS);
     }
 }
 
@@ -506,17 +519,11 @@ static void pipe_task(void *arg)
          * carrying state across frames would improve quality at the cost of loss tolerance. */
         int16_t *p16 = (int16_t *)pcm;
         if (s_up_codec == CODEC_OPUS_16K) {
-            /* Opus wants 16 kHz: wideband calls already are; narrowband is interpolated up */
-            static int16_t wb[OPUS_LINK_SAMPLES];
-            const int16_t *src = p16;
-            if (!msbc) {
-                size_t ns = want / 2;   /* 160 */
-                for (size_t i = 0; i < ns; i++) {
-                    int16_t a = p16[i], b = i + 1 < ns ? p16[i + 1] : p16[i];
-                    wb[2 * i] = a; wb[2 * i + 1] = (int16_t)((a + b) / 2);
-                }
-                src = wb;
+            /* Opus runs at 8 kHz: a wideband (mSBC) call is decimated by 2 */
+            if (msbc) {
+                for (size_t i = 0; i < OPUS_LINK_SAMPLES; i++) p16[i] = (int16_t)((p16[2 * i] + p16[2 * i + 1]) / 2);
             }
+            const int16_t *src = p16;
             frame[0] = s_tx_seq; frame[1] = s_tx_seq >> 8;
             frame[2] = CODEC_OPUS_16K;
             frame[3] = 0; frame[4] = 0; frame[5] = 0;
