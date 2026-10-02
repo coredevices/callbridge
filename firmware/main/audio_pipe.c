@@ -7,11 +7,13 @@
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_hf_client_api.h"
 #include "esp_timer.h"
 
 #include "adpcm.h"
+#include "opus_link.h"
 #include "ble_gatt.h"
 #include "spp_link.h"
 #include "link_policy.h"
@@ -22,6 +24,7 @@ static const char *TAG = "PIPE";
 #define FRAME_HDR        6
 #define CODEC_ADPCM_8K   0x01
 #define CODEC_ADPCM_16K  0x02
+#define CODEC_OPUS_16K   0x03   /* Opus, 16 kHz, 20 ms, 16 kbps CBR (40 bytes) */
 #define CODEC_BLAST      0xFF
 #define FRAME_MS         20
 
@@ -40,6 +43,7 @@ static const char *TAG = "PIPE";
 #define CTRL_KEEPALIVE   0x18   /* no-op; the phone sends it to keep RFCOMM credits flowing */
 #define CTRL_LINK_ECHO   0x19   /* u8: 1 = send downlink frames straight back up (bypasses SCO; link test) */
 #define CTRL_BLE_ITVL    0x1A   /* u8: BLE connection interval in 1.25 ms units */
+#define CTRL_UP_CODEC    0x1B   /* u8: uplink codec, 0x01 ADPCM 8 kHz or 0x03 Opus 16 kHz */
 
 /* ring sizes: sco_in holds 100 ms, sco_out (jitter buffer) 400 ms, both at 16 kHz */
 #define SCO_IN_BYTES     (16000 * 2 / 10)
@@ -58,8 +62,10 @@ static volatile bool s_msbc = false;
 static volatile bool s_loopback = true;   /* on by default: proves the audio path without an app */
 static volatile bool s_blast = false;
 static volatile bool s_link_echo = false;
+static volatile uint8_t s_up_codec = CODEC_OPUS_16K;
 typedef struct { uint16_t len; uint8_t data[FRAME_HDR + 160]; } echo_item_t;
 static QueueHandle_t s_echo_q;
+static QueueHandle_t s_dec_q;   /* Opus frames from the BT task to the decoder task */
 static volatile bool s_ble_up = false;
 static volatile uint32_t s_sco_gen = 0;    /* bumped on every SCO (re)connect; pipe task resyncs */
 /* call state inputs, combined by derive_call_state() */
@@ -285,7 +291,7 @@ void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
     uint8_t codec = f[2];
     adpcm_state_t st = { .predictor = (int16_t)(f[3] | (f[4] << 8)), .index = f[5] > 88 ? 88 : f[5] };
     size_t n = len - FRAME_HDR;
-    if (codec != CODEC_ADPCM_8K && codec != CODEC_ADPCM_16K) {
+    if (codec != CODEC_ADPCM_8K && codec != CODEC_ADPCM_16K && codec != CODEC_OPUS_16K) {
         return;
     }
     if (s_last_rx_seq >= 0) {
@@ -298,6 +304,14 @@ void audio_pipe_rx_frame(const uint8_t *f, uint16_t len)
         return;   /* loopback owns the SCO out path */
     }
     int16_t pcm[MAX_PCM_FRAME / 2];
+    if (codec == CODEC_OPUS_16K) {
+        /* decoding needs ~20 KB of stack: hand it to the decoder task instead of doing it in the BT task */
+        echo_item_t it;
+        it.len = len > sizeof it.data ? sizeof it.data : len;
+        memcpy(it.data, f, it.len);
+        if (xQueueSend(s_dec_q, &it, 0) != pdTRUE) s_st.rx_late++;
+        return;
+    }
     if (n * 2 > sizeof pcm / sizeof pcm[0]) n = sizeof pcm / sizeof pcm[0] / 2;
     adpcm_decode(&st, f + FRAME_HDR, n, pcm);
     size_t samples = n * 2;
@@ -343,6 +357,7 @@ void audio_pipe_control(const uint8_t *m, uint16_t len)
     case CTRL_SPP_BATCH: if (len >= 2) audio_pipe_set_spp_batch(m[1]); break;
     case CTRL_KEEPALIVE: break;
     case CTRL_BLE_ITVL: if (len >= 2) ble_gatt_set_conn_interval(m[1]); break;
+    case CTRL_UP_CODEC: if (len >= 2 && (m[1] == CODEC_ADPCM_8K || m[1] == CODEC_OPUS_16K)) s_up_codec = m[1]; break;
     case CTRL_LINK_ECHO:
         if (len >= 2) {
             s_link_echo = m[1] != 0;
@@ -395,6 +410,25 @@ void audio_pipe_print_stats(void)
     link_policy_print_window();
     printf("spp_write_failures=%" PRIu32 " sco_in_bytes=%" PRIu32 " sco_out_bytes=%" PRIu32 " link_rx_bytes=%" PRIu32 " uptime_ms=%" PRIu32 "\n",
            spp_link_write_failures(), s_st.sco_in_bytes, s_st.sco_out_bytes, s_st.link_rx_bytes, (uint32_t)(esp_timer_get_time() / 1000));
+}
+
+/* ---- decoder task: Opus downlink frames -> SCO out ring ---- */
+static void dec_task(void *arg)
+{
+    echo_item_t it;
+    static int16_t pcm[OPUS_LINK_SAMPLES];
+    for (;;) {
+        if (xQueueReceive(s_dec_q, &it, portMAX_DELAY) != pdTRUE) continue;
+        int got = opus_link_decode(it.data + FRAME_HDR, it.len - FRAME_HDR, pcm);
+        if (got <= 0) { s_st.rx_late++; continue; }
+        size_t samples = got;
+        if (!s_msbc) {   /* narrowband call: 16 kHz -> 8 kHz */
+            for (size_t i = 0; i < samples / 2; i++) pcm[i] = (int16_t)((pcm[2 * i] + pcm[2 * i + 1]) / 2);
+            samples /= 2;
+        }
+        out_prefill_if_empty();
+        out_write((uint8_t *)pcm, samples * 2, JITTER_MAX_MS);
+    }
 }
 
 /* ---- pipeline task (core 1): SCO in -> ADPCM -> BLE ---- */
@@ -470,8 +504,28 @@ static void pipe_task(void *arg)
         adpcm_state_t st = { .predictor = 0, .index = 0 };
         /* ponytail: encoder state resets per frame (predictor 0, index 0) so every frame is self-contained;
          * carrying state across frames would improve quality at the cost of loss tolerance. */
-        /* the link always carries 8 kHz frames (86 bytes); a wideband call is decimated by 2 */
         int16_t *p16 = (int16_t *)pcm;
+        if (s_up_codec == CODEC_OPUS_16K) {
+            /* Opus wants 16 kHz: wideband calls already are; narrowband is interpolated up */
+            static int16_t wb[OPUS_LINK_SAMPLES];
+            const int16_t *src = p16;
+            if (!msbc) {
+                size_t ns = want / 2;   /* 160 */
+                for (size_t i = 0; i < ns; i++) {
+                    int16_t a = p16[i], b = i + 1 < ns ? p16[i + 1] : p16[i];
+                    wb[2 * i] = a; wb[2 * i + 1] = (int16_t)((a + b) / 2);
+                }
+                src = wb;
+            }
+            frame[0] = s_tx_seq; frame[1] = s_tx_seq >> 8;
+            frame[2] = CODEC_OPUS_16K;
+            frame[3] = 0; frame[4] = 0; frame[5] = 0;
+            int nb = opus_link_encode(src, frame + FRAME_HDR, OPUS_LINK_MAX);
+            if (nb > 0 && send_audio(frame, FRAME_HDR + nb)) s_st.tx_frames++; else s_st.tx_dropped++;
+            s_tx_seq++;
+            continue;
+        }
+        /* ADPCM: the link carries 8 kHz frames (86 bytes); a wideband call is decimated by 2 */
         size_t samples = want / 2;
         if (msbc) {
             for (size_t i = 0; i < samples / 2; i++) p16[i] = (int16_t)((p16[2 * i] + p16[2 * i + 1]) / 2);
@@ -496,5 +550,9 @@ void audio_pipe_init(void)
     s_sco_out = xRingbufferCreate(SCO_OUT_BYTES, RINGBUF_TYPE_BYTEBUF);
     s_out_lock = xSemaphoreCreateMutex();
     s_echo_q = xQueueCreate(16, sizeof(echo_item_t));
-    xTaskCreatePinnedToCore(pipe_task, "audio_pipe", 4096, NULL, 10, NULL, 1);
+    opus_link_init();
+    /* libopus keeps ~21 KB of scratch on the stack; PSRAM stacks cost ~3% encode time (measured) */
+    s_dec_q = xQueueCreate(8, sizeof(echo_item_t));
+    xTaskCreatePinnedToCoreWithCaps(pipe_task, "audio_pipe", 32768, NULL, 10, NULL, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    xTaskCreatePinnedToCoreWithCaps(dec_task, "opus_dec", 32768, NULL, 11, NULL, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }

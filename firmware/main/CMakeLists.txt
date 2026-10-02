@@ -1,5 +1,6 @@
 idf_component_register(SRCS "app_hf_msg_set.c"
                             "adpcm.c"
+                            "opus_link.c"
                             "audio_pipe.c"
                             "ble_gatt.c"
                             "link_policy.c"

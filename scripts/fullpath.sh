@@ -19,7 +19,7 @@ sleep 2
 $C unrelay 1 >/dev/null; $C unsco 1 >/dev/null; $C disconnect 4 >/dev/null
 $C "ka$KA" 1 >/dev/null
 echo "== link ${LINK:-ble}, keepalive ${KA} ms, batch ${BATCH}, echo at ${ECHO}"
-if [ "${LINK:-ble}" = spp ]; then $C connectspp 8 | sed 's/^ *callbridge: //'; else $C connect 14 | sed 's/^ *callbridge: //'; fi
+if [ "${LINK:-ble}" = spp ]; then $C connectspp 8 | sed 's/^ *callbridge: //'; else $C connect 20 | sed 's/^ *callbridge: //'; fi
 sleep 2   # let service discovery and notification setup finish before the first write
 if [ -n "${ITVL:-}" ]; then $C "itvl$ITVL" 3 | sed 's/^ *callbridge: //'; fi
 $C sco 6 >/dev/null

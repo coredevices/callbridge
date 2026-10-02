@@ -29,6 +29,10 @@
 #include "spp_link.h"
 #include "link_policy.h"
 #include "esp_heap_caps.h"
+#include "opus_link.h"
+#include "esp_timer.h"
+#include <math.h>
+#include "freertos/idf_additions.h"
 
 esp_bd_addr_t peer_addr = {0};
 static char peer_bdname[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
@@ -185,6 +189,41 @@ static int cmd_adv(int argc, char **argv)
     if (argc >= 2) ble_gatt_set_advertising(argv[1][0] != '0');
     return 0;
 }
+/* Opus self-test: encode + decode 50 frames of a 1 kHz tone, report time per frame and stack used.
+ * Runs in its own task with a large stack (libopus keeps its scratch buffers on the stack). */
+static void opustest_task(void *arg);
+static int cmd_opustest(int argc, char **argv)
+{
+    TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    bool psram = argc >= 2 && argv[1][0] == 'p';
+    printf("stack in %s\n", psram ? "PSRAM" : "internal RAM");
+    if (psram) xTaskCreatePinnedToCoreWithCaps(opustest_task, "opustest", 65536, self, 5, NULL, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    else xTaskCreatePinnedToCore(opustest_task, "opustest", 65536, self, 5, NULL, 1);
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10000));
+    return 0;
+}
+static void opustest_task(void *arg)
+{
+    static int16_t pcm[OPUS_LINK_SAMPLES], out[OPUS_LINK_SAMPLES];
+    uint8_t pkt[OPUS_LINK_MAX];
+    for (int i = 0; i < OPUS_LINK_SAMPLES; i++) pcm[i] = (int16_t)(8000 * sinf(2 * 3.14159f * 1000 * i / 16000));
+    printf("internal free %u, psram free %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    int64_t te = 0, td = 0; int bytes = 0, ok = 0;
+    for (int f = 0; f < 50; f++) {
+        int64_t t0 = esp_timer_get_time();
+        int n = opus_link_encode(pcm, pkt, sizeof pkt);
+        int64_t t1 = esp_timer_get_time();
+        int d = n > 0 ? opus_link_decode(pkt, n, out) : -1;
+        int64_t t2 = esp_timer_get_time();
+        te += t1 - t0; td += t2 - t1;
+        if (n > 0 && d > 0) { ok++; bytes = n; }
+        if (f == 0) printf("first frame: encode %lld us -> %d bytes, decode %lld us -> %d samples\n", t1 - t0, n, t2 - t1, d);
+    }
+    printf("50 frames: ok %d, %d bytes/frame, encode avg %lld us, decode avg %lld us (budget 20000)\n", ok, bytes, te / 50, td / 50);
+    printf("stack used: %u of 65536 bytes\n", (unsigned)(65536 - uxTaskGetStackHighWaterMark(NULL)));
+    xTaskNotifyGive((TaskHandle_t)arg);
+    vTaskSuspend(NULL);   /* ponytail: leaks the test task (WithCaps tasks can't self-delete); fine for a debug command */
+}
 static int cmd_top(int argc, char **argv)
 {
     static char buf[2048];
@@ -202,6 +241,8 @@ static void register_callbridge_cmds(void)
     ESP_ERROR_CHECK(esp_console_cmd_register(&batch));
     const esp_console_cmd_t adv = { .command = "adv", .help = "adv <0|1>: BLE advertising off/on", .func = &cmd_adv };
     ESP_ERROR_CHECK(esp_console_cmd_register(&adv));
+    const esp_console_cmd_t ot = { .command = "opustest", .help = "encode/decode 50 Opus frames, report timing", .func = &cmd_opustest };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&ot));
     ESP_ERROR_CHECK(esp_console_cmd_register(&lb));
     ESP_ERROR_CHECK(esp_console_cmd_register(&st));
     ESP_ERROR_CHECK(esp_console_cmd_register(&top));

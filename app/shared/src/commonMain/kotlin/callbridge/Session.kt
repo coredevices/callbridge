@@ -207,7 +207,10 @@ class Session(private val scope: CoroutineScope) {
                     delay(20L * (downlinkBatch - batch.size))
                     while (batch.size < downlinkBatch) batch += downlink.tryReceive().getOrNull() ?: break
                 }
-                t.sendAudioBatch(batch)
+                // a failed audio write is a lost frame, not a dead link (the link's own state flow reports drops)
+                try { t.sendAudioBatch(batch) } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                    _stats.update { it.copy(downDropped = it.downDropped + batch.size) }
+                }
             }
         }
         if (t.kind == "spp" && keepaliveMs > 0) bleJobs += guardedBle(t) {
@@ -272,7 +275,14 @@ class Session(private val scope: CoroutineScope) {
     /** Writes a control message; false if not connected or the write failed (the link may have just dropped). */
     suspend fun sendControl(msg: ByteArray): Boolean {
         val t = bleTransport ?: return false
-        return try { t.sendControl(msg); true } catch (e: CancellationException) { throw e } catch (e: Exception) { println("callbridge control write failed: $e"); false }
+        // a write right after connect can hit a GATT procedure still in flight (MTU, parameter update): retry
+        repeat(3) { attempt ->
+            try { t.sendControl(msg); return true } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                println("callbridge control write failed (attempt ${attempt + 1}): $e")
+                delay(200)
+            }
+        }
+        return false
     }
 
     /**

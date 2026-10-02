@@ -36,8 +36,16 @@ class RelayService : Service() {
         // Android silently throttles apps that start more than 5 scans in 30 s.
         val bonded = android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.firstOrNull { it.name == "callbridge" }
         if (bonded != null) {
-            if (session.preferSpp) session.connectSpp(bonded.address, bonded.name) else session.connectBleAddress(bonded.address, bonded.name)
-            if (session.ble.value is callbridge.BleState.Connected) return
+            // enabling notifications right after connect sometimes fails (GATT 133, mostly just after the
+            // dongle rebooted) and tears the link down; give it a moment to settle and retry
+            repeat(4) { attempt ->
+                if (session.preferSpp) session.connectSpp(bonded.address, bonded.name) else session.connectBleAddress(bonded.address, bonded.name)
+                kotlinx.coroutines.delay(1500)
+                if (session.ble.value is callbridge.BleState.Connected) return
+                Log.i("callbridge", "connect attempt ${attempt + 1} failed: ${session.ble.value}")
+                session.disconnectBle()
+                kotlinx.coroutines.delay(1000)
+            }
         }
         val adv = withTimeout(10_000) { scanCallbridge().first() }
         session.connectBle(adv)

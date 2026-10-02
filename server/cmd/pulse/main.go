@@ -18,6 +18,12 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coredevices/callbridge/server/audio"
+	"github.com/coredevices/callbridge/server/opus"
+)
+
+const (
+	codecOpus16k = 0x03
+	frameHeader  = 6
 )
 
 type pulse struct {
@@ -34,7 +40,8 @@ func main() {
 	mode := flag.String("mode", "room", "room (phone echoes) or echo (server echoes; sanity check)")
 	interval := flag.Duration("interval", 3*time.Second, "time between pulses")
 	count := flag.Int("count", 0, "pulses to send (0 = forever)")
-	rate := flag.Int("rate", 8000, "sample rate: 8000 (CVSD link) or 16000 (mSBC)")
+	rate := flag.Int("rate", 8000, "ADPCM sample rate (ignored for opus)")
+	codec := flag.String("codec", "opus", "opus (16 kHz, 16 kbps, 40-byte frames) or adpcm (8 kHz, 86-byte frames)")
 	probe := flag.Int("probe", 0, "probe mode: send marker frames of this many bytes at 50/s and time every one (needs a byte-level echo, e.g. dongle link echo)")
 	dur := flag.Duration("dur", 30*time.Second, "probe mode duration")
 	flag.Parse()
@@ -58,13 +65,52 @@ func main() {
 
 	const frameDur = 20 * time.Millisecond
 	const minLevel = 0.0008
-	silence := audio.EncodeFrames(make([]int16, *rate*20/1000), *rate, 0)[0]
 	// distinct pulse frequencies, all inside the 300-3400 Hz voice band of the SCO link
 	freqs := []float64{700, 900, 1100, 1300, 1500, 1700}
+	var silence []byte
 	tones := make([][][]byte, len(freqs))
-	for i, hz := range freqs {
-		tones[i] = audio.EncodeFrames(append(audio.ToneAt(*rate, hz, audio.BurstMs), make([]int16, *rate*20/1000)...), *rate, 0)
+	var decode func([]byte) ([]int16, int)
+	if *codec == "opus" {
+		const r = 16000
+		enc, err := opus.NewEncoder(r, 16000)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		dec, _ := opus.NewDecoder(r)
+		frame := func(pcm []int16) []byte {
+			pkt, _ := enc.Encode(pcm)
+			return append([]byte{0, 0, codecOpus16k, 0, 0, 0}, pkt...)
+		}
+		frames := func(pcm []int16) [][]byte {
+			var out [][]byte
+			for off := 0; off+r/50 <= len(pcm); off += r / 50 {
+				out = append(out, frame(pcm[off:off+r/50]))
+			}
+			return out
+		}
+		silence = frame(make([]int16, r/50))
+		for i, hz := range freqs {
+			tones[i] = frames(append(audio.ToneAt(r, hz, audio.BurstMs), make([]int16, r/50)...))
+		}
+		decode = func(f []byte) ([]int16, int) {
+			if len(f) <= frameHeader || f[2] != codecOpus16k {
+				return audio.DecodeFrame(f)
+			}
+			pcm, err := dec.Decode(f[frameHeader:])
+			if err != nil {
+				return nil, 0
+			}
+			return pcm, r
+		}
+	} else {
+		silence = audio.EncodeFrames(make([]int16, *rate*20/1000), *rate, 0)[0]
+		for i, hz := range freqs {
+			tones[i] = audio.EncodeFrames(append(audio.ToneAt(*rate, hz, audio.BurstMs), make([]int16, *rate*20/1000)...), *rate, 0)
+		}
+		decode = audio.DecodeFrame
 	}
+	fmt.Printf("codec %s, frame %d bytes\n", *codec, len(silence))
 
 	var (
 		mu      sync.Mutex
@@ -103,7 +149,7 @@ func main() {
 				lastSeq = seq
 			}
 			rxSec++
-			pcm, r := audio.DecodeFrame(data)
+			pcm, r := decode(data)
 			if pcm == nil {
 				mu.Unlock()
 				continue
